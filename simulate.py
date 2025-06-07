@@ -1,7 +1,9 @@
 import argparse
 import warnings
+import contextlib
 import torch
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoModelForSequenceClassification
+from transformers.modeling_utils import no_init_weights
 
 
 def load_model(model_name: str):
@@ -15,8 +17,13 @@ def load_model(model_name: str):
         elif "ForSequenceClassification" in arch:
             model_cls = AutoModelForSequenceClassification
 
-    # Instantiate the model from the configuration only to avoid loading weights
-    model = model_cls.from_config(config, trust_remote_code=True)
+    # Instantiate the model on the meta device without allocating weights
+    try:
+        with no_init_weights():
+            model = model_cls.from_config(config, trust_remote_code=True)
+    except ImportError as exc:
+        raise RuntimeError(f"Failed to load model '{model_name}': {exc}")
+    model.to("meta")
     model.eval()
     return model
 
@@ -44,7 +51,17 @@ def parse_ops(model):
 
     handles = [m.register_forward_hook(hook) for m in model.modules() if len(list(m.children())) == 0]
     model.to("meta")
-    model(**{k: (v.to("meta") if isinstance(v, torch.Tensor) else v) for k, v in dummy.items()})
+    def patched_autocast(device_type=None, **kwargs):
+        if device_type == "meta":
+            return contextlib.nullcontext()
+        return torch.autocast(device_type=device_type, **kwargs)
+
+    orig_autocast = torch.autocast
+    torch.autocast = patched_autocast
+    try:
+        model(**{k: (v.to("meta") if isinstance(v, torch.Tensor) else v) for k, v in dummy.items()})
+    finally:
+        torch.autocast = orig_autocast
     for h in handles:
         h.remove()
 
