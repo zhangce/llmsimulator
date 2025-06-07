@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""
+LLM Simulator - Parse operators and dependencies from HuggingFace models
+"""
+
+import argparse
+import sys
+from typing import Dict, List, Set, Tuple
+import torch
+import torch.nn as nn
+from transformers import AutoModel, AutoConfig
+from collections import defaultdict, deque
+
+
+class ModelOperatorParser:
+    """Parse operators and their dependencies from a HuggingFace model."""
+    
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        self.operators = {}
+        self.dependencies = defaultdict(set)
+        
+    def load_model(self):
+        """Load the HuggingFace model."""
+        try:
+            print(f"Loading model: {self.model_name}")
+            self.config = AutoConfig.from_pretrained(self.model_name)
+            self.model = AutoModel.from_pretrained(self.model_name, torch_dtype=torch.float16)
+            print(f"Model loaded successfully!")
+            return True
+        except Exception as e:
+            print(f"Error loading model {self.model_name}: {e}")
+            return False
+    
+    def get_operator_type(self, module: nn.Module) -> str:
+        """Get the operator type from a PyTorch module."""
+        module_type = type(module).__name__
+        
+        # Map common PyTorch modules to operator types
+        operator_mapping = {
+            'Linear': 'Linear',
+            'Conv1d': 'Conv1D',
+            'Conv2d': 'Conv2D',
+            'LayerNorm': 'LayerNorm',
+            'RMSNorm': 'RMSNorm',
+            'Embedding': 'Embedding',
+            'MultiheadAttention': 'MultiHeadAttention',
+            'GELU': 'GELU',
+            'ReLU': 'ReLU',
+            'SiLU': 'SiLU',
+            'Tanh': 'Tanh',
+            'Softmax': 'Softmax',
+            'Dropout': 'Dropout',
+            'ModuleList': 'ModuleList',
+            'Sequential': 'Sequential',
+        }
+        
+        return operator_mapping.get(module_type, module_type)
+    
+    def parse_operators(self):
+        """Parse all operators from the model."""
+        if not hasattr(self, 'model'):
+            print("Model not loaded. Call load_model() first.")
+            return
+        
+        print("\nParsing operators...")
+        
+        # Walk through all named modules
+        for name, module in self.model.named_modules():
+            if name == '':  # Skip the root module
+                continue
+                
+            operator_type = self.get_operator_type(module)
+            
+            # Get module parameters info
+            param_count = sum(p.numel() for p in module.parameters() if p.requires_grad)
+            
+            # Store operator info
+            self.operators[name] = {
+                'type': operator_type,
+                'module': module,
+                'parameters': param_count,
+                'shape_info': self._get_shape_info(module)
+            }
+            
+            # Determine dependencies based on module hierarchy
+            self._analyze_dependencies(name)
+    
+    def _get_shape_info(self, module: nn.Module) -> Dict:
+        """Extract shape information from a module."""
+        shape_info = {}
+        
+        if hasattr(module, 'weight') and module.weight is not None:
+            shape_info['weight_shape'] = list(module.weight.shape)
+        
+        if hasattr(module, 'bias') and module.bias is not None:
+            shape_info['bias_shape'] = list(module.bias.shape)
+            
+        if hasattr(module, 'in_features'):
+            shape_info['in_features'] = module.in_features
+            
+        if hasattr(module, 'out_features'):
+            shape_info['out_features'] = module.out_features
+            
+        if hasattr(module, 'num_embeddings'):
+            shape_info['num_embeddings'] = module.num_embeddings
+            
+        if hasattr(module, 'embedding_dim'):
+            shape_info['embedding_dim'] = module.embedding_dim
+            
+        return shape_info
+    
+    def _analyze_dependencies(self, module_name: str):
+        """Analyze dependencies between modules based on hierarchy."""
+        parts = module_name.split('.')
+        
+        # Add dependency on parent modules
+        for i in range(1, len(parts)):
+            parent_name = '.'.join(parts[:i])
+            if parent_name in self.operators:
+                self.dependencies[module_name].add(parent_name)
+        
+        # For sequential modules, add dependencies on previous modules
+        if len(parts) >= 2:
+            parent_parts = parts[:-1]
+            current_idx = parts[-1]
+            
+            # If the current part is a number, it might be in a sequential container
+            try:
+                idx = int(current_idx)
+                if idx > 0:
+                    prev_module = '.'.join(parent_parts + [str(idx - 1)])
+                    if prev_module in self.operators:
+                        self.dependencies[module_name].add(prev_module)
+            except ValueError:
+                pass
+    
+    def display_operators(self):
+        """Display all operators and their information."""
+        if not self.operators:
+            print("No operators found. Run parse_operators() first.")
+            return
+        
+        print(f"\n{'='*80}")
+        print(f"OPERATORS IN MODEL: {self.model_name}")
+        print(f"{'='*80}")
+        print(f"Total operators found: {len(self.operators)}")
+        print()
+        
+        # Group operators by type
+        operators_by_type = defaultdict(list)
+        for name, info in self.operators.items():
+            operators_by_type[info['type']].append((name, info))
+        
+        # Display operators grouped by type
+        for op_type, ops in sorted(operators_by_type.items()):
+            print(f"\n{op_type} ({len(ops)} instances):")
+            print("-" * 50)
+            
+            for name, info in sorted(ops):
+                print(f"  {name}")
+                if info['parameters'] > 0:
+                    print(f"    Parameters: {info['parameters']:,}")
+                
+                if info['shape_info']:
+                    for key, value in info['shape_info'].items():
+                        print(f"    {key}: {value}")
+                
+                # Show dependencies
+                if name in self.dependencies and self.dependencies[name]:
+                    deps = sorted(list(self.dependencies[name]))
+                    print(f"    Dependencies: {', '.join(deps[:3])}")
+                    if len(deps) > 3:
+                        print(f"      ... and {len(deps) - 3} more")
+                print()
+    
+    def display_dependency_graph(self):
+        """Display the dependency graph."""
+        print(f"\n{'='*80}")
+        print("DEPENDENCY GRAPH")
+        print(f"{'='*80}")
+        
+        if not self.dependencies:
+            print("No dependencies found.")
+            return
+        
+        for module, deps in sorted(self.dependencies.items()):
+            if deps:
+                print(f"{module} depends on:")
+                for dep in sorted(deps):
+                    print(f"  -> {dep}")
+                print()
+    
+    def get_statistics(self):
+        """Get model statistics."""
+        if not self.operators:
+            return {}
+        
+        stats = {
+            'total_operators': len(self.operators),
+            'total_parameters': sum(info['parameters'] for info in self.operators.values()),
+            'operator_types': len(set(info['type'] for info in self.operators.values())),
+            'operators_by_type': defaultdict(int)
+        }
+        
+        for info in self.operators.values():
+            stats['operators_by_type'][info['type']] += 1
+        
+        return stats
+    
+    def display_summary(self):
+        """Display a summary of the model."""
+        stats = self.get_statistics()
+        
+        print(f"\n{'='*80}")
+        print("MODEL SUMMARY")
+        print(f"{'='*80}")
+        print(f"Model: {self.model_name}")
+        print(f"Total operators: {stats['total_operators']}")
+        print(f"Total parameters: {stats['total_parameters']:,}")
+        print(f"Unique operator types: {stats['operator_types']}")
+        print()
+        
+        print("Operator distribution:")
+        for op_type, count in sorted(stats['operators_by_type'].items()):
+            print(f"  {op_type}: {count}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='LLM Simulator - Parse operators from HuggingFace models')
+    parser.add_argument('--model', required=True, help='HuggingFace model name (e.g., Qwen/Qwen3-Reranker-4B)')
+    parser.add_argument('--ops', action='store_true', help='Parse and display operators')
+    parser.add_argument('--deps', action='store_true', help='Show dependency graph')
+    parser.add_argument('--summary', action='store_true', help='Show model summary')
+    
+    args = parser.parse_args()
+    
+    if not args.ops and not args.deps and not args.summary:
+        print("Please specify at least one of: --ops, --deps, --summary")
+        sys.exit(1)
+    
+    # Create parser instance
+    parser_instance = ModelOperatorParser(args.model)
+    
+    # Load model
+    if not parser_instance.load_model():
+        sys.exit(1)
+    
+    # Parse operators
+    parser_instance.parse_operators()
+    
+    # Display requested information
+    if args.summary:
+        parser_instance.display_summary()
+    
+    if args.ops:
+        parser_instance.display_operators()
+    
+    if args.deps:
+        parser_instance.display_dependency_graph()
+
+
+if __name__ == '__main__':
+    main()
