@@ -31,6 +31,7 @@ python simulate.py --model Qwen/Qwen3-0.6B --ops
 - `--ops`: Parse and display all operators with detailed information including input/output tensor shapes
 - `--deps`: Show dependency graph between operators
 - `--summary`: Show model summary with statistics
+- `--topological`: Display operators in topological order based on actual execution
 
 ### Examples
 
@@ -49,9 +50,14 @@ python simulate.py --model Qwen/Qwen3-0.6B --ops
    python simulate.py --model bert-base-uncased --deps
    ```
 
-4. **Combine multiple options**:
+4. **Display operators in topological execution order**:
    ```bash
-   python simulate.py --model gpt2 --ops --summary --deps
+   python simulate.py --model gpt2 --topological
+   ```
+
+5. **Combine multiple options**:
+   ```bash
+   python simulate.py --model gpt2 --ops --summary --deps --topological
    ```
 
 ## Output Information
@@ -74,6 +80,12 @@ For each operator, the tool displays:
 ### Dependencies (`--deps`)
 - Hierarchical dependencies between modules
 - Parent-child relationships in the model architecture
+
+### Topological Order (`--topological`)
+- Operators displayed in execution order consistent with actual forward pass
+- Shows the sequence in which operators are executed during inference
+- Includes execution dependencies based on actual runtime behavior
+- Useful for understanding the computational flow and optimization opportunities
 
 ## Supported Models
 
