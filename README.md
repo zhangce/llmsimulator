@@ -32,6 +32,7 @@ python simulate.py --model Qwen/Qwen3-0.6B --ops
 - `--deps`: Show dependency graph between operators
 - `--summary`: Show model summary with statistics
 - `--topological`: Display operators in topological order based on actual execution
+- `--multi-config`: Analyze tensor shapes across multiple batch sizes, context lengths, and prefill/decode modes
 
 ### Examples
 
@@ -55,9 +56,14 @@ python simulate.py --model Qwen/Qwen3-0.6B --ops
    python simulate.py --model gpt2 --topological
    ```
 
-5. **Combine multiple options**:
+5. **Analyze tensor shapes across multiple configurations**:
    ```bash
-   python simulate.py --model gpt2 --ops --summary --deps --topological
+   python simulate.py --model distilbert-base-uncased --multi-config
+   ```
+
+6. **Combine multiple options**:
+   ```bash
+   python simulate.py --model gpt2 --ops --summary --deps --topological --multi-config
    ```
 
 ## Output Information
@@ -86,6 +92,17 @@ For each operator, the tool displays:
 - Shows the sequence in which operators are executed during inference
 - Includes execution dependencies based on actual runtime behavior
 - Useful for understanding the computational flow and optimization opportunities
+
+### Multi-Configuration Analysis (`--multi-config`)
+- Comprehensive tensor shape analysis across different inference scenarios
+- Tests multiple batch sizes: 1, 16, 64
+- Tests multiple context lengths: 1, 128, 512
+- Analyzes both prefill and decode modes
+- Shows how tensor shapes change based on:
+  - **Batch size**: Impact on parallel processing
+  - **Context length**: Memory and computation scaling in prefill mode
+  - **Prefill vs Decode**: Different computation patterns for initial processing vs token generation
+- Essential for memory planning, performance optimization, and hardware sizing
 
 ## Supported Models
 

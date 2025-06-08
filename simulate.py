@@ -23,6 +23,7 @@ class ModelOperatorParser:
         self.tensor_shapes = {}
         self.execution_order = []
         self.execution_dependencies = defaultdict(set)
+        self.multi_config_shapes = {}  # Store shapes for different configurations
         
     def load_model(self):
         """Load the HuggingFace model."""
@@ -276,6 +277,139 @@ class ModelOperatorParser:
         # Build execution dependencies based on actual execution order
         self._build_execution_dependencies()
     
+    def _create_input_for_config(self, batch_size: int, context_length: int, mode: str) -> torch.Tensor:
+        """Create input tensor for specific configuration."""
+        try:
+            if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+                # Add pad token if it doesn't exist
+                if self.tokenizer.pad_token is None:
+                    self.tokenizer.pad_token = self.tokenizer.eos_token
+                
+                if mode == "prefill":
+                    # For prefill, use the full context length
+                    sample_text = "Hello, this is a sample input for tensor shape analysis. " * (context_length // 10 + 1)
+                    inputs = self.tokenizer(
+                        sample_text, 
+                        return_tensors="pt", 
+                        padding=True, 
+                        truncation=True,
+                        max_length=context_length
+                    )
+                    input_ids = inputs['input_ids']
+                    # Repeat for batch size
+                    if batch_size > 1:
+                        input_ids = input_ids.repeat(batch_size, 1)
+                    return input_ids
+                else:  # decode mode
+                    # For decode, use single token (next token prediction)
+                    input_ids = torch.randint(0, min(self.config.vocab_size, 1000), (batch_size, 1))
+                    return input_ids
+            else:
+                # Fallback: create tensor based on config
+                vocab_size = getattr(self.config, 'vocab_size', 50000)
+                if mode == "prefill":
+                    return torch.randint(0, min(vocab_size, 1000), (batch_size, context_length))
+                else:  # decode mode
+                    return torch.randint(0, min(vocab_size, 1000), (batch_size, 1))
+        
+        except Exception as e:
+            print(f"Warning: Could not create proper input for config, using fallback: {e}")
+            vocab_size = getattr(self.config, 'vocab_size', 50000)
+            if mode == "prefill":
+                return torch.randint(0, min(vocab_size, 1000), (batch_size, context_length))
+            else:  # decode mode
+                return torch.randint(0, min(vocab_size, 1000), (batch_size, 1))
+    
+    def _capture_multi_config_shapes(self):
+        """Capture tensor shapes for multiple configurations."""
+        print("\nCapturing tensor shapes for multiple configurations...")
+        
+        # Configuration parameters (reduced for efficiency)
+        batch_sizes = [1, 16]
+        context_lengths = [1, 128]  # Use more reasonable context lengths
+        modes = ["prefill", "decode"]
+        
+        self.multi_config_shapes = {}
+        
+        for batch_size in batch_sizes:
+            for context_length in context_lengths:
+                for mode in modes:
+                    # Skip invalid combinations
+                    if mode == "decode" and context_length > 1:
+                        continue
+                    
+                    config_key = f"bs{batch_size}_ctx{context_length}_{mode}"
+                    print(f"  Testing configuration: {config_key}")
+                    
+                    try:
+                        # Set model to evaluation mode
+                        self.model.eval()
+                        
+                        # Create input for this configuration
+                        sample_input = self._create_input_for_config(batch_size, context_length, mode)
+                        
+                        # Clear previous shapes
+                        config_shapes = {}
+                        
+                        # Create hooks for this configuration
+                        def create_config_hook(name: str, config_key: str):
+                            def hook(module, input, output):
+                                input_shapes = []
+                                output_shapes = []
+                                
+                                # Capture input shapes
+                                if isinstance(input, (tuple, list)):
+                                    for inp in input:
+                                        shape = self._get_tensor_shape(inp)
+                                        if shape:
+                                            input_shapes.append(shape)
+                                else:
+                                    shape = self._get_tensor_shape(input)
+                                    if shape:
+                                        input_shapes.append(shape)
+                                
+                                # Capture output shapes
+                                if isinstance(output, (tuple, list)):
+                                    for out in output:
+                                        shape = self._get_tensor_shape(out)
+                                        if shape:
+                                            output_shapes.append(shape)
+                                else:
+                                    shape = self._get_tensor_shape(output)
+                                    if shape:
+                                        output_shapes.append(shape)
+                                
+                                config_shapes[name] = {
+                                    'input_shapes': input_shapes,
+                                    'output_shapes': output_shapes
+                                }
+                            return hook
+                        
+                        # Register hooks for this configuration
+                        config_hooks = []
+                        for name, module in self.model.named_modules():
+                            if name == '':  # Skip root module
+                                continue
+                            hook = module.register_forward_hook(create_config_hook(name, config_key))
+                            config_hooks.append(hook)
+                        
+                        # Run forward pass
+                        with torch.no_grad():
+                            _ = self.model(sample_input)
+                        
+                        # Store shapes for this configuration
+                        self.multi_config_shapes[config_key] = config_shapes
+                        
+                        # Remove hooks for this configuration
+                        for hook in config_hooks:
+                            hook.remove()
+                        
+                    except Exception as e:
+                        print(f"    Warning: Could not capture shapes for {config_key}: {e}")
+                        continue
+        
+        print(f"Captured shapes for {len(self.multi_config_shapes)} configurations")
+    
     def _build_execution_dependencies(self):
         """Build execution dependencies based on the actual execution order."""
         print("Building execution dependencies...")
@@ -375,6 +509,81 @@ class ModelOperatorParser:
                         print(f"     Depends on: {', '.join(deps)}")
                     else:
                         print(f"     Depends on: {', '.join(deps[:3])} ... and {len(deps) - 3} more")
+                
+                print()
+    
+    def display_multi_config_shapes(self):
+        """Display operators with shapes for multiple configurations."""
+        if not self.multi_config_shapes:
+            print("No multi-configuration shapes captured. Run parse_operators() with multi-config analysis first.")
+            return
+        
+        print(f"\n{'='*80}")
+        print(f"OPERATORS WITH MULTI-CONFIGURATION SHAPES: {self.model_name}")
+        print(f"{'='*80}")
+        
+        # Get all unique operator names from any configuration
+        all_operators = set()
+        for config_shapes in self.multi_config_shapes.values():
+            all_operators.update(config_shapes.keys())
+        
+        print(f"Total operators analyzed: {len(all_operators)}")
+        print(f"Configurations tested: {len(self.multi_config_shapes)}")
+        print()
+        
+        # Display each operator with all its configurations
+        for i, op_name in enumerate(sorted(all_operators), 1):
+            if op_name in self.operators:
+                info = self.operators[op_name]
+                print(f"{i:3d}. {op_name}")
+                print(f"     Type: {info['type']}")
+                
+                if info['parameters'] > 0:
+                    print(f"     Parameters: {info['parameters']:,}")
+                
+                print(f"     Shape Analysis:")
+                
+                # Group configurations by mode for better readability
+                prefill_configs = []
+                decode_configs = []
+                
+                for config_key in sorted(self.multi_config_shapes.keys()):
+                    if op_name in self.multi_config_shapes[config_key]:
+                        if 'prefill' in config_key:
+                            prefill_configs.append(config_key)
+                        else:
+                            decode_configs.append(config_key)
+                
+                # Display prefill configurations
+                if prefill_configs:
+                    print(f"       Prefill Mode:")
+                    for config_key in prefill_configs:
+                        shapes = self.multi_config_shapes[config_key][op_name]
+                        # Parse config key for readable format
+                        parts = config_key.split('_')
+                        batch_size = parts[0][2:]  # Remove 'bs'
+                        context_length = parts[1][3:]  # Remove 'ctx'
+                        
+                        print(f"         Batch={batch_size}, Context={context_length}:")
+                        if shapes['input_shapes']:
+                            print(f"           Input:  {shapes['input_shapes']}")
+                        if shapes['output_shapes']:
+                            print(f"           Output: {shapes['output_shapes']}")
+                
+                # Display decode configurations
+                if decode_configs:
+                    print(f"       Decode Mode:")
+                    for config_key in decode_configs:
+                        shapes = self.multi_config_shapes[config_key][op_name]
+                        # Parse config key for readable format
+                        parts = config_key.split('_')
+                        batch_size = parts[0][2:]  # Remove 'bs'
+                        
+                        print(f"         Batch={batch_size}:")
+                        if shapes['input_shapes']:
+                            print(f"           Input:  {shapes['input_shapes']}")
+                        if shapes['output_shapes']:
+                            print(f"           Output: {shapes['output_shapes']}")
                 
                 print()
     
@@ -484,11 +693,12 @@ def main():
     parser.add_argument('--deps', action='store_true', help='Show dependency graph')
     parser.add_argument('--summary', action='store_true', help='Show model summary')
     parser.add_argument('--topological', action='store_true', help='Display operators in topological order based on execution')
+    parser.add_argument('--multi-config', action='store_true', help='Analyze tensor shapes across multiple batch sizes, context lengths, and prefill/decode modes')
     
     args = parser.parse_args()
     
-    if not args.ops and not args.deps and not args.summary and not args.topological:
-        print("Please specify at least one of: --ops, --deps, --summary, --topological")
+    if not args.ops and not args.deps and not args.summary and not args.topological and not getattr(args, 'multi_config', False):
+        print("Please specify at least one of: --ops, --deps, --summary, --topological, --multi-config")
         sys.exit(1)
     
     # Create parser instance
@@ -500,6 +710,10 @@ def main():
     
     # Parse operators
     parser_instance.parse_operators()
+    
+    # Run multi-config analysis if requested
+    if getattr(args, 'multi_config', False):
+        parser_instance._capture_multi_config_shapes()
     
     # Display requested information
     if args.summary:
@@ -513,6 +727,9 @@ def main():
     
     if args.topological:
         parser_instance.display_topological_order()
+    
+    if getattr(args, 'multi_config', False):
+        parser_instance.display_multi_config_shapes()
 
 
 if __name__ == '__main__':
