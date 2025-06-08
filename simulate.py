@@ -301,8 +301,20 @@ class ModelOperatorParser:
                         input_ids = input_ids.repeat(batch_size, 1)
                     return input_ids
                 else:  # decode mode
-                    # For decode, use single token (next token prediction)
-                    input_ids = torch.randint(0, min(self.config.vocab_size, 1000), (batch_size, 1))
+                    # For decode, model still attends to full context but processes 1 new token
+                    # Create a context with the specified length to simulate KV cache state
+                    sample_text = "Hello, this is a sample input for tensor shape analysis. " * (context_length // 10 + 1)
+                    inputs = self.tokenizer(
+                        sample_text, 
+                        return_tensors="pt", 
+                        padding=True, 
+                        truncation=True,
+                        max_length=context_length
+                    )
+                    input_ids = inputs['input_ids']
+                    # Repeat for batch size
+                    if batch_size > 1:
+                        input_ids = input_ids.repeat(batch_size, 1)
                     return input_ids
             else:
                 # Fallback: create tensor based on config
@@ -310,7 +322,7 @@ class ModelOperatorParser:
                 if mode == "prefill":
                     return torch.randint(0, min(vocab_size, 1000), (batch_size, context_length))
                 else:  # decode mode
-                    return torch.randint(0, min(vocab_size, 1000), (batch_size, 1))
+                    return torch.randint(0, min(vocab_size, 1000), (batch_size, context_length))
         
         except Exception as e:
             print(f"Warning: Could not create proper input for config, using fallback: {e}")
@@ -318,7 +330,7 @@ class ModelOperatorParser:
             if mode == "prefill":
                 return torch.randint(0, min(vocab_size, 1000), (batch_size, context_length))
             else:  # decode mode
-                return torch.randint(0, min(vocab_size, 1000), (batch_size, 1))
+                return torch.randint(0, min(vocab_size, 1000), (batch_size, context_length))
     
     def _capture_multi_config_shapes(self):
         """Capture tensor shapes for multiple configurations."""
@@ -334,9 +346,6 @@ class ModelOperatorParser:
         for batch_size in batch_sizes:
             for context_length in context_lengths:
                 for mode in modes:
-                    # Skip invalid combinations
-                    if mode == "decode" and context_length > 1:
-                        continue
                     
                     config_key = f"bs{batch_size}_ctx{context_length}_{mode}"
                     print(f"  Testing configuration: {config_key}")
@@ -578,8 +587,9 @@ class ModelOperatorParser:
                         # Parse config key for readable format
                         parts = config_key.split('_')
                         batch_size = parts[0][2:]  # Remove 'bs'
+                        context_length = parts[1][3:]  # Remove 'ctx'
                         
-                        print(f"         Batch={batch_size}:")
+                        print(f"         Batch={batch_size}, Context={context_length}:")
                         if shapes['input_shapes']:
                             print(f"           Input:  {shapes['input_shapes']}")
                         if shapes['output_shapes']:

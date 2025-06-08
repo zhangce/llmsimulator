@@ -100,8 +100,10 @@ For each operator, the tool displays:
 - Analyzes both prefill and decode modes
 - Shows how tensor shapes change based on:
   - **Batch size**: Impact on parallel processing
-  - **Context length**: Memory and computation scaling in prefill mode
-  - **Prefill vs Decode**: Different computation patterns for initial processing vs token generation
+  - **Context length**: Memory and computation scaling for both prefill and decode
+  - **Prefill vs Decode**: Different computation patterns
+    - **Prefill**: Process full input context (e.g., 128 tokens)
+    - **Decode**: Generate tokens one by one, but still attend to full context (prefilled + generated tokens)
 - Essential for memory planning, performance optimization, and hardware sizing
 
 ## Supported Models
