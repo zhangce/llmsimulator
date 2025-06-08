@@ -21,6 +21,8 @@ class ModelOperatorParser:
         self.dependencies = defaultdict(set)
         self.hooks = []
         self.tensor_shapes = {}
+        self.execution_order = []
+        self.execution_dependencies = defaultdict(set)
         
     def load_model(self):
         """Load the HuggingFace model."""
@@ -157,10 +159,13 @@ class ModelOperatorParser:
             return []
     
     def _create_forward_hook(self, name: str):
-        """Create a forward hook to capture input/output tensor shapes."""
+        """Create a forward hook to capture input/output tensor shapes and execution order."""
         def hook(module, input, output):
             input_shapes = []
             output_shapes = []
+            
+            # Track execution order
+            self.execution_order.append(name)
             
             # Capture input shapes
             if isinstance(input, (tuple, list)):
@@ -267,6 +272,111 @@ class ModelOperatorParser:
         finally:
             # Always remove hooks
             self._remove_hooks()
+            
+        # Build execution dependencies based on actual execution order
+        self._build_execution_dependencies()
+    
+    def _build_execution_dependencies(self):
+        """Build execution dependencies based on the actual execution order."""
+        print("Building execution dependencies...")
+        
+        # Clear previous execution dependencies
+        self.execution_dependencies.clear()
+        
+        # Build dependencies based on execution order
+        for i, current_module in enumerate(self.execution_order):
+            # Each module depends on all modules that executed before it
+            for j in range(i):
+                prev_module = self.execution_order[j]
+                if prev_module != current_module:  # Avoid self-dependencies
+                    self.execution_dependencies[current_module].add(prev_module)
+        
+        print(f"Built execution dependencies for {len(self.execution_dependencies)} modules")
+    
+    def _topological_sort(self) -> List[str]:
+        """Perform topological sort based on execution dependencies."""
+        # Use Kahn's algorithm for topological sorting
+        
+        # Calculate in-degrees
+        in_degree = defaultdict(int)
+        all_modules = set(self.execution_order)
+        
+        # Initialize in-degrees
+        for module in all_modules:
+            in_degree[module] = 0
+        
+        # Calculate in-degrees based on execution dependencies
+        for module, deps in self.execution_dependencies.items():
+            for dep in deps:
+                if dep in all_modules:
+                    in_degree[module] += 1
+        
+        # Initialize queue with modules having no dependencies
+        queue = deque([module for module in all_modules if in_degree[module] == 0])
+        result = []
+        
+        while queue:
+            current = queue.popleft()
+            result.append(current)
+            
+            # For each module that depends on current module
+            for module, deps in self.execution_dependencies.items():
+                if current in deps:
+                    in_degree[module] -= 1
+                    if in_degree[module] == 0:
+                        queue.append(module)
+        
+        # Check for cycles (shouldn't happen with execution order, but good to verify)
+        if len(result) != len(all_modules):
+            print("Warning: Cycle detected in execution dependencies, using execution order")
+            return self.execution_order
+        
+        return result
+    
+    def display_topological_order(self):
+        """Display operators in topological order based on execution."""
+        if not self.execution_order:
+            print("No execution order captured. Run parse_operators() first.")
+            return
+        
+        print(f"\n{'='*80}")
+        print(f"OPERATORS IN TOPOLOGICAL ORDER: {self.model_name}")
+        print(f"{'='*80}")
+        print(f"Total operators: {len(set(self.execution_order))}")
+        print()
+        
+        # Get topological order
+        topo_order = self._topological_sort()
+        
+        print("Execution order (topologically sorted):")
+        print("-" * 50)
+        
+        for i, name in enumerate(topo_order, 1):
+            if name in self.operators:
+                info = self.operators[name]
+                print(f"{i:3d}. {name}")
+                print(f"     Type: {info['type']}")
+                
+                if info['parameters'] > 0:
+                    print(f"     Parameters: {info['parameters']:,}")
+                
+                # Show input/output tensor shapes
+                if name in self.tensor_shapes:
+                    tensor_info = self.tensor_shapes[name]
+                    if tensor_info['input_shapes']:
+                        print(f"     Input shapes: {tensor_info['input_shapes']}")
+                    if tensor_info['output_shapes']:
+                        print(f"     Output shapes: {tensor_info['output_shapes']}")
+                
+                # Show execution dependencies (limited to avoid clutter)
+                if name in self.execution_dependencies and self.execution_dependencies[name]:
+                    deps = sorted(list(self.execution_dependencies[name]))
+                    if len(deps) <= 3:
+                        print(f"     Depends on: {', '.join(deps)}")
+                    else:
+                        print(f"     Depends on: {', '.join(deps[:3])} ... and {len(deps) - 3} more")
+                
+                print()
     
     def display_operators(self):
         """Display all operators and their information."""
@@ -373,11 +483,12 @@ def main():
     parser.add_argument('--ops', action='store_true', help='Parse and display operators with input/output tensor shapes')
     parser.add_argument('--deps', action='store_true', help='Show dependency graph')
     parser.add_argument('--summary', action='store_true', help='Show model summary')
+    parser.add_argument('--topological', action='store_true', help='Display operators in topological order based on execution')
     
     args = parser.parse_args()
     
-    if not args.ops and not args.deps and not args.summary:
-        print("Please specify at least one of: --ops, --deps, --summary")
+    if not args.ops and not args.deps and not args.summary and not args.topological:
+        print("Please specify at least one of: --ops, --deps, --summary, --topological")
         sys.exit(1)
     
     # Create parser instance
@@ -399,6 +510,9 @@ def main():
     
     if args.deps:
         parser_instance.display_dependency_graph()
+    
+    if args.topological:
+        parser_instance.display_topological_order()
 
 
 if __name__ == '__main__':
