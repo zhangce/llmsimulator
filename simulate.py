@@ -72,12 +72,16 @@ class ModelOperatorParser:
         
         print("\nParsing operators...")
         
-        # Walk through all named modules
+        # Walk through all named modules and collect only actual operators
         for name, module in self.model.named_modules():
             if name == '':  # Skip the root module
                 continue
                 
             operator_type = self.get_operator_type(module)
+            
+            # Skip container modules that don't perform actual operations
+            if self._is_container_module(module):
+                continue
             
             # Get module parameters info
             param_count = sum(p.numel() for p in module.parameters() if p.requires_grad)
@@ -89,9 +93,9 @@ class ModelOperatorParser:
                 'parameters': param_count,
                 'shape_info': self._get_shape_info(module)
             }
-            
-            # Determine dependencies based on module hierarchy
-            self._analyze_dependencies(name)
+        
+        # Parse actual execution dependencies by tracking data flow
+        self._parse_execution_dependencies()
         
         # Capture tensor shapes through forward pass
         self._capture_tensor_shapes()
@@ -120,30 +124,166 @@ class ModelOperatorParser:
             
         return shape_info
     
-    def _analyze_dependencies(self, module_name: str):
-        """Analyze dependencies between modules based on hierarchy."""
-        parts = module_name.split('.')
+    def _is_container_module(self, module: nn.Module) -> bool:
+        """Check if a module is a container that doesn't perform actual operations."""
+        container_types = (
+            nn.ModuleList, nn.ModuleDict, nn.Sequential,
+            nn.ParameterList, nn.ParameterDict
+        )
         
-        # Add dependency on parent modules
-        for i in range(1, len(parts)):
-            parent_name = '.'.join(parts[:i])
-            if parent_name in self.operators:
-                self.dependencies[module_name].add(parent_name)
+        # Check if it's a known container type
+        if isinstance(module, container_types):
+            return True
         
-        # For sequential modules, add dependencies on previous modules
-        if len(parts) >= 2:
-            parent_parts = parts[:-1]
-            current_idx = parts[-1]
+        # Check if it has no parameters and only contains other modules
+        has_params = any(p.requires_grad for p in module.parameters(recurse=False))
+        has_children = len(list(module.children())) > 0
+        
+        return not has_params and has_children
+    
+    def _parse_execution_dependencies(self):
+        """Parse actual execution dependencies by analyzing model structure."""
+        print("Analyzing execution dependencies...")
+        
+        # Clear existing dependencies
+        self.dependencies.clear()
+        
+        # Group operators by layer/level for sequential dependencies
+        layer_groups = self._group_operators_by_layer()
+        
+        # Add sequential dependencies between layers
+        self._add_sequential_dependencies(layer_groups)
+        
+        # Add intra-layer dependencies (within attention blocks, etc.)
+        self._add_intra_layer_dependencies()
+        
+        print(f"Found {sum(len(deps) for deps in self.dependencies.values())} execution dependencies")
+    
+    def _group_operators_by_layer(self) -> Dict[str, List[str]]:
+        """Group operators by their layer/level in the model."""
+        layer_groups = defaultdict(list)
+        
+        for name in self.operators.keys():
+            # Extract layer information from module name
+            parts = name.split('.')
             
-            # If the current part is a number, it might be in a sequential container
-            try:
-                idx = int(current_idx)
-                if idx > 0:
-                    prev_module = '.'.join(parent_parts + [str(idx - 1)])
-                    if prev_module in self.operators:
-                        self.dependencies[module_name].add(prev_module)
-            except ValueError:
-                pass
+            # Find layer indicators
+            layer_key = None
+            for i, part in enumerate(parts):
+                if part in ['layer', 'layers', 'blocks', 'h'] and i + 1 < len(parts):
+                    # Next part should be the layer number
+                    try:
+                        layer_num = int(parts[i + 1])
+                        layer_key = f"{'.'.join(parts[:i+2])}"
+                        break
+                    except ValueError:
+                        continue
+                elif part.isdigit() and i > 0:
+                    # Direct numeric layer
+                    layer_key = f"{'.'.join(parts[:i+1])}"
+                    break
+            
+            if layer_key:
+                layer_groups[layer_key].append(name)
+            else:
+                # Put in a general group
+                layer_groups['other'].append(name)
+        
+        return layer_groups
+    
+    def _add_sequential_dependencies(self, layer_groups: Dict[str, List[str]]):
+        """Add dependencies between sequential layers."""
+        # Sort layer groups by layer number
+        sorted_layers = []
+        other_ops = []
+        
+        for layer_key, ops in layer_groups.items():
+            if layer_key == 'other':
+                other_ops.extend(ops)
+                continue
+                
+            # Extract layer number for sorting
+            parts = layer_key.split('.')
+            layer_num = None
+            for part in parts:
+                if part.isdigit():
+                    layer_num = int(part)
+                    break
+            
+            if layer_num is not None:
+                sorted_layers.append((layer_num, layer_key, ops))
+        
+        # Sort by layer number
+        sorted_layers.sort(key=lambda x: x[0])
+        
+        # Add dependencies between consecutive layers
+        # Each layer depends on the output operations of the previous layer
+        for i in range(1, len(sorted_layers)):
+            prev_layer_ops = sorted_layers[i-1][2]
+            curr_layer_ops = sorted_layers[i][2]
+            
+            # Find the "output" operations of the previous layer
+            # These are typically the last operations in the execution order
+            prev_output_ops = self._find_layer_output_ops(prev_layer_ops)
+            
+            # Each operator in current layer depends on the output ops of previous layer
+            for curr_op in curr_layer_ops:
+                for prev_output_op in prev_output_ops:
+                    self.dependencies[curr_op].add(prev_output_op)
+    
+    def _find_layer_output_ops(self, layer_ops: List[str]) -> List[str]:
+        """Find the output operations of a layer (typically the last operations)."""
+        # For transformer layers, the output is usually:
+        # 1. The output layer norm, or
+        # 2. The final linear layer in FFN, or  
+        # 3. The last operation alphabetically as fallback
+        
+        output_ops = []
+        
+        # Look for output layer norm first
+        for op in layer_ops:
+            if 'output' in op and 'norm' in op:
+                output_ops.append(op)
+        
+        # If no output norm, look for FFN output (lin2, fc2, etc.)
+        if not output_ops:
+            for op in layer_ops:
+                if ('ffn' in op or 'mlp' in op) and ('lin2' in op or 'fc2' in op or 'dense' in op):
+                    output_ops.append(op)
+        
+        # If still no output ops, take the last few operations as fallback
+        if not output_ops:
+            # Sort and take last 2-3 operations as potential outputs
+            sorted_ops = sorted(layer_ops)
+            output_ops = sorted_ops[-2:] if len(sorted_ops) > 2 else sorted_ops
+        
+        return output_ops
+    
+    def _add_intra_layer_dependencies(self):
+        """Add dependencies within layers (e.g., attention -> FFN)."""
+        for name in self.operators.keys():
+            parts = name.split('.')
+            
+            # Look for common patterns
+            if 'attention' in parts or 'attn' in parts:
+                # Attention operations typically come before FFN
+                layer_prefix = '.'.join(parts[:-1])
+                
+                # Find FFN operations in the same layer
+                for other_name in self.operators.keys():
+                    if other_name.startswith(layer_prefix) and ('ffn' in other_name or 'mlp' in other_name):
+                        self.dependencies[other_name].add(name)
+            
+            elif 'norm' in parts or 'layer_norm' in parts:
+                # Layer norms typically come before other operations
+                layer_prefix = '.'.join(parts[:-1])
+                
+                # Find other operations in the same layer that should depend on norm
+                for other_name in self.operators.keys():
+                    if (other_name.startswith(layer_prefix) and 
+                        other_name != name and 
+                        'norm' not in other_name):
+                        self.dependencies[other_name].add(name)
     
     def _get_tensor_shape(self, tensor: Any) -> List[int]:
         """Extract shape from tensor, handling various tensor types."""
