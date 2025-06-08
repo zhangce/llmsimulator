@@ -10,6 +10,10 @@ import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoConfig, AutoTokenizer
 from collections import defaultdict, deque
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import networkx as nx
+from pathlib import Path
 
 
 class ModelOperatorParser:
@@ -365,6 +369,216 @@ class ModelOperatorParser:
         print("Operator distribution:")
         for op_type, count in sorted(stats['operators_by_type'].items()):
             print(f"  {op_type}: {count}")
+    
+    def create_dependency_graph(self) -> nx.DiGraph:
+        """Create a NetworkX directed graph from the dependencies."""
+        G = nx.DiGraph()
+        
+        # Add all operators as nodes
+        for name, info in self.operators.items():
+            G.add_node(name, 
+                      operator_type=info['type'],
+                      parameters=info['parameters'],
+                      tensor_shapes=self.tensor_shapes.get(name, {}))
+        
+        # Add edges for dependencies
+        for module, deps in self.dependencies.items():
+            for dep in deps:
+                if dep in self.operators:  # Only add edges to actual operators
+                    G.add_edge(dep, module)
+        
+        return G
+    
+    def _get_operator_color(self, operator_type: str) -> str:
+        """Get color for operator type."""
+        color_map = {
+            'Linear': '#FF6B6B',           # Red
+            'Embedding': '#4ECDC4',        # Teal
+            'LayerNorm': '#45B7D1',        # Blue
+            'RMSNorm': '#45B7D1',          # Blue
+            'Dropout': '#96CEB4',          # Light Green
+            'GELU': '#FFEAA7',             # Yellow
+            'ReLU': '#FFEAA7',             # Yellow
+            'SiLU': '#FFEAA7',             # Yellow
+            'Softmax': '#FFEAA7',          # Yellow
+            'MultiHeadAttention': '#DDA0DD', # Plum
+            'Conv1D': '#FFB347',           # Orange
+            'Conv2D': '#FFB347',           # Orange
+            'ModuleList': '#D3D3D3',       # Light Gray
+            'Sequential': '#D3D3D3',       # Light Gray
+        }
+        
+        # For model-specific operators, use purple variants
+        if any(model_name in operator_type for model_name in ['Qwen', 'Bert', 'GPT', 'Distil']):
+            return '#9B59B6'  # Purple
+        
+        return color_map.get(operator_type, '#95A5A6')  # Default gray
+    
+    def _create_hierarchical_layout(self, G: nx.DiGraph) -> Dict[str, Tuple[float, float]]:
+        """Create a hierarchical layout based on module hierarchy."""
+        pos = {}
+        
+        # Group nodes by their hierarchy level
+        levels = defaultdict(list)
+        for node in G.nodes():
+            level = len(node.split('.'))
+            levels[level].append(node)
+        
+        # Position nodes level by level
+        y_spacing = 2.0
+        x_spacing = 1.5
+        
+        for level, nodes in levels.items():
+            y = -level * y_spacing
+            
+            # Sort nodes within level for better organization
+            nodes.sort()
+            
+            # Calculate x positions to center the level
+            total_width = (len(nodes) - 1) * x_spacing
+            start_x = -total_width / 2
+            
+            for i, node in enumerate(nodes):
+                x = start_x + i * x_spacing
+                pos[node] = (x, y)
+        
+        return pos
+    
+    def visualize_dependency_graph(self, output_file: str = None, max_nodes: int = 50, 
+                                 layout: str = 'hierarchical', show_labels: bool = True,
+                                 figsize: Tuple[int, int] = (20, 16)):
+        """
+        Visualize the dependency graph.
+        
+        Args:
+            output_file: Path to save the visualization (optional)
+            max_nodes: Maximum number of nodes to display (for performance)
+            layout: Layout algorithm ('hierarchical', 'spring', 'circular')
+            show_labels: Whether to show node labels
+            figsize: Figure size (width, height)
+        """
+        if not self.operators:
+            print("No operators found. Run parse_operators() first.")
+            return
+        
+        print(f"Creating dependency graph visualization...")
+        
+        # Create the graph
+        G = self.create_dependency_graph()
+        
+        # Limit nodes if graph is too large
+        if len(G.nodes()) > max_nodes:
+            print(f"Graph has {len(G.nodes())} nodes. Limiting to {max_nodes} most connected nodes.")
+            
+            # Get nodes with highest degree (most connections)
+            node_degrees = dict(G.degree())
+            top_nodes = sorted(node_degrees.items(), key=lambda x: x[1], reverse=True)[:max_nodes]
+            top_node_names = [node for node, _ in top_nodes]
+            
+            # Create subgraph with top nodes
+            G = G.subgraph(top_node_names).copy()
+        
+        # Set up the plot
+        plt.figure(figsize=figsize)
+        plt.title(f"Operator Dependency Graph - {self.model_name}\n"
+                 f"Nodes: {len(G.nodes())}, Edges: {len(G.edges())}", 
+                 fontsize=16, fontweight='bold', pad=20)
+        
+        # Choose layout
+        if layout == 'hierarchical':
+            pos = self._create_hierarchical_layout(G)
+        elif layout == 'spring':
+            pos = nx.spring_layout(G, k=3, iterations=50, seed=42)
+        elif layout == 'circular':
+            pos = nx.circular_layout(G)
+        else:
+            pos = nx.spring_layout(G, seed=42)
+        
+        # Get node colors based on operator types
+        node_colors = []
+        operator_types = set()
+        
+        for node in G.nodes():
+            if node in self.operators:
+                op_type = self.operators[node]['type']
+                operator_types.add(op_type)
+                node_colors.append(self._get_operator_color(op_type))
+            else:
+                node_colors.append('#95A5A6')  # Gray for unknown
+        
+        # Calculate node sizes based on parameters
+        node_sizes = []
+        for node in G.nodes():
+            if node in self.operators:
+                params = self.operators[node]['parameters']
+                # Scale node size based on parameters (log scale for better visualization)
+                if params > 0:
+                    size = max(100, min(1000, 100 + (params / 1000000) * 200))
+                else:
+                    size = 50
+                node_sizes.append(size)
+            else:
+                node_sizes.append(100)
+        
+        # Draw the graph
+        nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=node_sizes, 
+                              alpha=0.8, linewidths=1, edgecolors='black')
+        
+        nx.draw_networkx_edges(G, pos, edge_color='gray', arrows=True, 
+                              arrowsize=20, arrowstyle='->', alpha=0.6, width=1)
+        
+        if show_labels:
+            # Create labels (shortened for readability)
+            labels = {}
+            for node in G.nodes():
+                if '.' in node:
+                    # Show only the last part of the module name
+                    labels[node] = node.split('.')[-1]
+                else:
+                    labels[node] = node
+            
+            nx.draw_networkx_labels(G, pos, labels, font_size=8, font_weight='bold')
+        
+        # Create legend for operator types
+        legend_elements = []
+        for op_type in sorted(operator_types):
+            color = self._get_operator_color(op_type)
+            legend_elements.append(mpatches.Patch(color=color, label=op_type))
+        
+        if legend_elements:
+            plt.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(1.02, 1), 
+                      fontsize=10, title="Operator Types", title_fontsize=12)
+        
+        # Add statistics text
+        stats_text = f"Total Operators: {len(self.operators)}\n"
+        stats_text += f"Total Parameters: {sum(info['parameters'] for info in self.operators.values()):,}\n"
+        stats_text += f"Displayed Nodes: {len(G.nodes())}\n"
+        stats_text += f"Dependencies: {len(G.edges())}"
+        
+        plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes, 
+                fontsize=10, verticalalignment='top', 
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        
+        plt.axis('off')
+        plt.tight_layout()
+        
+        # Save or show the plot
+        if output_file:
+            output_path = Path(output_file)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(output_file, dpi=300, bbox_inches='tight', 
+                       facecolor='white', edgecolor='none')
+            print(f"Dependency graph saved to: {output_file}")
+        else:
+            # Save to default location
+            default_file = f"{self.model_name.replace('/', '_')}_dependency_graph.png"
+            plt.savefig(default_file, dpi=300, bbox_inches='tight',
+                       facecolor='white', edgecolor='none')
+            print(f"Dependency graph saved to: {default_file}")
+        
+        plt.show()
+        
+        return G
 
 
 def main():
@@ -373,11 +587,21 @@ def main():
     parser.add_argument('--ops', action='store_true', help='Parse and display operators with input/output tensor shapes')
     parser.add_argument('--deps', action='store_true', help='Show dependency graph')
     parser.add_argument('--summary', action='store_true', help='Show model summary')
+    parser.add_argument('--visualize', action='store_true', help='Create graphical dependency graph visualization')
+    
+    # Visualization options
+    parser.add_argument('--output', type=str, help='Output file for visualization (default: auto-generated)')
+    parser.add_argument('--max-nodes', type=int, default=50, help='Maximum nodes to display in visualization (default: 50)')
+    parser.add_argument('--layout', choices=['hierarchical', 'spring', 'circular'], default='hierarchical',
+                       help='Layout algorithm for visualization (default: hierarchical)')
+    parser.add_argument('--no-labels', action='store_true', help='Hide node labels in visualization')
+    parser.add_argument('--figsize', type=int, nargs=2, default=[20, 16], metavar=('WIDTH', 'HEIGHT'),
+                       help='Figure size for visualization (default: 20 16)')
     
     args = parser.parse_args()
     
-    if not args.ops and not args.deps and not args.summary:
-        print("Please specify at least one of: --ops, --deps, --summary")
+    if not args.ops and not args.deps and not args.summary and not args.visualize:
+        print("Please specify at least one of: --ops, --deps, --summary, --visualize")
         sys.exit(1)
     
     # Create parser instance
@@ -399,6 +623,15 @@ def main():
     
     if args.deps:
         parser_instance.display_dependency_graph()
+    
+    if args.visualize:
+        parser_instance.visualize_dependency_graph(
+            output_file=args.output,
+            max_nodes=args.max_nodes,
+            layout=args.layout,
+            show_labels=not args.no_labels,
+            figsize=tuple(args.figsize)
+        )
 
 
 if __name__ == '__main__':

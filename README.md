@@ -31,6 +31,7 @@ python simulate.py --model Qwen/Qwen3-0.6B --ops
 - `--ops`: Parse and display all operators with detailed information including input/output tensor shapes
 - `--deps`: Show dependency graph between operators
 - `--summary`: Show model summary with statistics
+- `--visualize`: Create graphical dependency graph visualization
 
 ### Examples
 
@@ -49,9 +50,14 @@ python simulate.py --model Qwen/Qwen3-0.6B --ops
    python simulate.py --model bert-base-uncased --deps
    ```
 
-4. **Combine multiple options**:
+4. **Create dependency graph visualization**:
    ```bash
-   python simulate.py --model gpt2 --ops --summary --deps
+   python simulate.py --model Qwen/Qwen3-0.6B --visualize
+   ```
+
+5. **Combine multiple options**:
+   ```bash
+   python simulate.py --model gpt2 --ops --summary --deps --visualize
    ```
 
 ## Output Information
@@ -74,6 +80,21 @@ For each operator, the tool displays:
 ### Dependencies (`--deps`)
 - Hierarchical dependencies between modules
 - Parent-child relationships in the model architecture
+
+### Visualization (`--visualize`)
+- **Graphical dependency graph** showing operator relationships
+- **Color-coded nodes** by operator type
+- **Node sizes** proportional to parameter count
+- **Multiple layout options**: hierarchical, spring, circular
+- **Customizable output**: PNG files with high resolution
+- **Interactive features**: legends, statistics, and labels
+
+#### Visualization Options
+- `--output FILE`: Specify output file path
+- `--max-nodes N`: Limit displayed nodes (default: 50)
+- `--layout LAYOUT`: Choose layout algorithm (hierarchical/spring/circular)
+- `--no-labels`: Hide node labels for cleaner view
+- `--figsize W H`: Set figure dimensions
 
 ## Supported Models
 
