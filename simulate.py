@@ -366,17 +366,33 @@ class ModelOperatorParser:
     
     def _connect_embeddings_to_first_layer(self, layer_groups: Dict[str, List[str]]):
         """Connect embedding output to the first transformer layer."""
-        # Find embedding output (typically dropout)
+        # Find embedding output - try different patterns for different model architectures
         embedding_output = None
+        
+        # Pattern 1: DistilBERT/BERT style (embeddings.dropout)
         for name in self.operators.keys():
             if name.startswith('embeddings.') and 'dropout' in name:
                 embedding_output = name
                 break
         
+        # Pattern 2: DistilBERT/BERT style (embeddings.LayerNorm)
         if not embedding_output:
-            # Fallback to LayerNorm if no dropout
             for name in self.operators.keys():
                 if name.startswith('embeddings.') and ('LayerNorm' in name or 'layer_norm' in name):
+                    embedding_output = name
+                    break
+        
+        # Pattern 3: Qwen/LLaMA style (embed_tokens)
+        if not embedding_output:
+            for name in self.operators.keys():
+                if name in ['embed_tokens', 'wte', 'word_embeddings']:
+                    embedding_output = name
+                    break
+        
+        # Pattern 4: Any embedding-like operation
+        if not embedding_output:
+            for name in self.operators.keys():
+                if any(x in name.lower() for x in ['embed', 'embedding']) and not name.startswith('layers.'):
                     embedding_output = name
                     break
         
