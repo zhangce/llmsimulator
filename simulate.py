@@ -2,7 +2,12 @@ import argparse
 import warnings
 import contextlib
 import torch
-from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoModelForSequenceClassification
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
+)
 from transformers.modeling_utils import no_init_weights
 
 
@@ -28,6 +33,16 @@ def load_model(model_name: str):
     return model
 
 
+def _gather_shapes(obj):
+    if isinstance(obj, torch.Tensor):
+        return list(obj.shape)
+    if isinstance(obj, (list, tuple)):
+        return [_gather_shapes(o) for o in obj]
+    if isinstance(obj, dict):
+        return {k: _gather_shapes(v) for k, v in obj.items()}
+    return str(type(obj).__name__)
+
+
 def parse_ops(model):
     """Collect operators by executing the model on meta tensors."""
     dummy = getattr(model, "dummy_inputs", None) or {"input_ids": torch.ones(1, 1, dtype=torch.long, device="meta")}
@@ -36,12 +51,14 @@ def parse_ops(model):
 
     ops = []
     deps = {}
+    shapes = {}
     idx = 0
 
     def hook(mod, inp, out):
         nonlocal idx
         name = f"{mod.__class__.__name__}_{idx}"
         ops.append((name, mod))
+        shapes[name] = (_gather_shapes(inp), _gather_shapes(out))
         for t in inp:
             if isinstance(t, torch.Tensor) and hasattr(t, "_src"):
                 deps.setdefault(name, set()).add(t._src)
@@ -67,7 +84,8 @@ def parse_ops(model):
 
     result = []
     for name, _ in ops:
-        result.append((name, sorted(deps.get(name, []))))
+        input_shape, output_shape = shapes.get(name, (None, None))
+        result.append((name, sorted(deps.get(name, [])), input_shape, output_shape))
     return result
 
 
@@ -81,9 +99,9 @@ def main():
     model = load_model(args.model)
 
     if args.ops:
-        for name, deps in parse_ops(model):
+        for name, deps, in_shape, out_shape in parse_ops(model):
             deps_str = ", ".join(deps)
-            print(f"{name} -> [{deps_str}]")
+            print(f"{name} -> [{deps_str}]  in={in_shape} out={out_shape}")
 
 
 if __name__ == "__main__":

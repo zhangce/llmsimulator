@@ -17,3 +17,8 @@ def test_parse_ops(model_name):
         pytest.skip(str(exc))
     ops = parse_ops(model)
     assert len(ops) > 0
+    # each entry should include dependency list and shape info
+    name, deps, in_shape, out_shape = ops[0]
+    assert isinstance(deps, list)
+    assert in_shape is None or isinstance(in_shape, (list, dict))
+    assert out_shape is None or isinstance(out_shape, (list, dict))
