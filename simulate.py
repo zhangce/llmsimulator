@@ -142,20 +142,26 @@ class ModelOperatorParser:
         return not has_params and has_children
     
     def _parse_execution_dependencies(self):
-        """Parse actual execution dependencies by analyzing model structure."""
+        """Parse actual execution dependencies by analyzing transformer execution flow."""
         print("Analyzing execution dependencies...")
         
         # Clear existing dependencies
         self.dependencies.clear()
         
-        # Group operators by layer/level for sequential dependencies
+        # 1. Build embedding dependencies (the true root)
+        self._add_embedding_dependencies()
+        
+        # 2. Group operators by layer for sequential dependencies
         layer_groups = self._group_operators_by_layer()
         
-        # Add sequential dependencies between layers
+        # 3. Add intra-layer dependencies (within each transformer layer)
+        self._add_intra_layer_dependencies(layer_groups)
+        
+        # 4. Add sequential dependencies between layers
         self._add_sequential_dependencies(layer_groups)
         
-        # Add intra-layer dependencies (within attention blocks, etc.)
-        self._add_intra_layer_dependencies()
+        # 5. Connect embeddings to first transformer layer
+        self._connect_embeddings_to_first_layer(layer_groups)
         
         print(f"Found {sum(len(deps) for deps in self.dependencies.values())} execution dependencies")
     
@@ -259,31 +265,133 @@ class ModelOperatorParser:
         
         return output_ops
     
-    def _add_intra_layer_dependencies(self):
-        """Add dependencies within layers (e.g., attention -> FFN)."""
+    def _add_embedding_dependencies(self):
+        """Add dependencies within the embedding layer."""
+        embedding_ops = [name for name in self.operators.keys() if name.startswith('embeddings.')]
+        
+        if not embedding_ops:
+            return
+            
+        # Typical embedding flow: word_embeddings + position_embeddings → LayerNorm → dropout
+        word_emb = None
+        pos_emb = None
+        layer_norm = None
+        dropout = None
+        
+        for op in embedding_ops:
+            if 'word_embeddings' in op:
+                word_emb = op
+            elif 'position_embeddings' in op:
+                pos_emb = op
+            elif 'LayerNorm' in op or 'layer_norm' in op:
+                layer_norm = op
+            elif 'dropout' in op:
+                dropout = op
+        
+        # Build embedding chain
+        if layer_norm:
+            if word_emb:
+                self.dependencies[layer_norm].add(word_emb)
+            if pos_emb:
+                self.dependencies[layer_norm].add(pos_emb)
+        
+        if dropout and layer_norm:
+            self.dependencies[dropout].add(layer_norm)
+    
+    def _add_intra_layer_dependencies(self, layer_groups: Dict[str, List[str]]):
+        """Add dependencies within each transformer layer."""
+        for layer_key, ops in layer_groups.items():
+            if layer_key == 'other':
+                continue
+                
+            # Group operations by type within the layer
+            sa_norm = None
+            attention_ops = []
+            output_norm = None
+            ffn_ops = []
+            
+            for op in ops:
+                if 'sa_layer_norm' in op:
+                    sa_norm = op
+                elif 'output_layer_norm' in op:
+                    output_norm = op
+                elif 'attention' in op:
+                    attention_ops.append(op)
+                elif 'ffn' in op or 'mlp' in op:
+                    ffn_ops.append(op)
+            
+            # Build intra-layer dependencies: sa_norm → attention → output_norm → ffn
+            
+            # 1. Attention operations depend on self-attention layer norm
+            if sa_norm:
+                for att_op in attention_ops:
+                    self.dependencies[att_op].add(sa_norm)
+            
+            # 2. Output layer norm depends on attention operations
+            if output_norm and attention_ops:
+                for att_op in attention_ops:
+                    self.dependencies[output_norm].add(att_op)
+            
+            # 3. FFN operations depend on output layer norm
+            if output_norm:
+                for ffn_op in ffn_ops:
+                    self.dependencies[ffn_op].add(output_norm)
+            
+            # 4. Add dependencies within FFN (lin1 → activation → dropout → lin2)
+            ffn_lin1 = [op for op in ffn_ops if 'lin1' in op]
+            ffn_activation = [op for op in ffn_ops if 'activation' in op]
+            ffn_dropout = [op for op in ffn_ops if 'dropout' in op]
+            ffn_lin2 = [op for op in ffn_ops if 'lin2' in op]
+            
+            # Chain FFN operations
+            for lin1 in ffn_lin1:
+                for activation in ffn_activation:
+                    self.dependencies[activation].add(lin1)
+                for dropout in ffn_dropout:
+                    self.dependencies[dropout].add(lin1)
+            
+            for activation in ffn_activation:
+                for lin2 in ffn_lin2:
+                    self.dependencies[lin2].add(activation)
+            
+            for dropout in ffn_dropout:
+                for lin2 in ffn_lin2:
+                    self.dependencies[lin2].add(dropout)
+    
+    def _connect_embeddings_to_first_layer(self, layer_groups: Dict[str, List[str]]):
+        """Connect embedding output to the first transformer layer."""
+        # Find embedding output (typically dropout)
+        embedding_output = None
         for name in self.operators.keys():
-            parts = name.split('.')
-            
-            # Look for common patterns
-            if 'attention' in parts or 'attn' in parts:
-                # Attention operations typically come before FFN
-                layer_prefix = '.'.join(parts[:-1])
-                
-                # Find FFN operations in the same layer
-                for other_name in self.operators.keys():
-                    if other_name.startswith(layer_prefix) and ('ffn' in other_name or 'mlp' in other_name):
-                        self.dependencies[other_name].add(name)
-            
-            elif 'norm' in parts or 'layer_norm' in parts:
-                # Layer norms typically come before other operations
-                layer_prefix = '.'.join(parts[:-1])
-                
-                # Find other operations in the same layer that should depend on norm
-                for other_name in self.operators.keys():
-                    if (other_name.startswith(layer_prefix) and 
-                        other_name != name and 
-                        'norm' not in other_name):
-                        self.dependencies[other_name].add(name)
+            if name.startswith('embeddings.') and 'dropout' in name:
+                embedding_output = name
+                break
+        
+        if not embedding_output:
+            # Fallback to LayerNorm if no dropout
+            for name in self.operators.keys():
+                if name.startswith('embeddings.') and ('LayerNorm' in name or 'layer_norm' in name):
+                    embedding_output = name
+                    break
+        
+        if not embedding_output:
+            return
+        
+        # Find first transformer layer (layer 0)
+        first_layer_ops = None
+        for layer_key, ops in layer_groups.items():
+            if layer_key != 'other' and '0' in layer_key:
+                first_layer_ops = ops
+                break
+        
+        if not first_layer_ops:
+            return
+        
+        # Connect embedding output to first layer's sa_layer_norm
+        for op in first_layer_ops:
+            if 'sa_layer_norm' in op:
+                self.dependencies[op].add(embedding_output)
+                break
     
     def _get_tensor_shape(self, tensor: Any) -> List[int]:
         """Extract shape from tensor, handling various tensor types."""
