@@ -223,19 +223,21 @@ class ModelOperatorParser:
         sorted_layers.sort(key=lambda x: x[0])
         
         # Add dependencies between consecutive layers
-        # Each layer depends on the output operations of the previous layer
+        # Only the ENTRY POINT of each layer depends on the previous layer
         for i in range(1, len(sorted_layers)):
             prev_layer_ops = sorted_layers[i-1][2]
             curr_layer_ops = sorted_layers[i][2]
             
             # Find the "output" operations of the previous layer
-            # These are typically the last operations in the execution order
             prev_output_ops = self._find_layer_output_ops(prev_layer_ops)
             
-            # Each operator in current layer depends on the output ops of previous layer
-            for curr_op in curr_layer_ops:
+            # Find the "entry point" of the current layer (typically sa_layer_norm)
+            curr_entry_ops = self._find_layer_entry_ops(curr_layer_ops)
+            
+            # Only entry operations depend on previous layer output
+            for curr_entry_op in curr_entry_ops:
                 for prev_output_op in prev_output_ops:
-                    self.dependencies[curr_op].add(prev_output_op)
+                    self.dependencies[curr_entry_op].add(prev_output_op)
     
     def _find_layer_output_ops(self, layer_ops: List[str]) -> List[str]:
         """Find the output operations of a layer (typically the last operations)."""
@@ -264,6 +266,29 @@ class ModelOperatorParser:
             output_ops = sorted_ops[-2:] if len(sorted_ops) > 2 else sorted_ops
         
         return output_ops
+    
+    def _find_layer_entry_ops(self, layer_ops: List[str]) -> List[str]:
+        """Find the entry point operations of a layer (typically sa_layer_norm)."""
+        entry_ops = []
+        
+        # Look for self-attention layer norm first (typical entry point)
+        for op in layer_ops:
+            if 'sa_layer_norm' in op:
+                entry_ops.append(op)
+        
+        if entry_ops:
+            return entry_ops
+        
+        # Fallback: look for any layer norm at the beginning
+        for op in layer_ops:
+            if 'layer_norm' in op and 'output' not in op:
+                entry_ops.append(op)
+        
+        if entry_ops:
+            return entry_ops
+        
+        # Last resort: return all operations (shouldn't happen in well-formed transformers)
+        return layer_ops
     
     def _add_embedding_dependencies(self):
         """Add dependencies within the embedding layer."""
