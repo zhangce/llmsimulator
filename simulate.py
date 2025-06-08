@@ -872,7 +872,7 @@ class ModelOperatorParser:
                         if shapes['output_shapes']:
                             print(f"           Output: {shapes['output_shapes']}")
                         
-                        # Add compact computational analysis
+                        # Add detailed computational analysis for this configuration
                         module = None
                         for module_name, module_obj in self.model.named_modules():
                             if module_name == op_name:
@@ -887,6 +887,11 @@ class ModelOperatorParser:
                         )
                         
                         print(f"           FLOPs: {analysis['flops']:,}, Memory: {analysis['memory_bytes']/1024/1024:.2f} MB")
+                        print(f"           Analysis:")
+                        # Indent the explanation further for multi-config
+                        for line in analysis['explanation'].split('\n'):
+                            if line.strip():
+                                print(f"             {line}")
                 
                 # Display decode configurations
                 if decode_configs:
@@ -904,7 +909,7 @@ class ModelOperatorParser:
                         if shapes['output_shapes']:
                             print(f"           Output: {shapes['output_shapes']}")
                         
-                        # Add compact computational analysis
+                        # Add detailed computational analysis for this configuration
                         module = None
                         for module_name, module_obj in self.model.named_modules():
                             if module_name == op_name:
@@ -919,6 +924,11 @@ class ModelOperatorParser:
                         )
                         
                         print(f"           FLOPs: {analysis['flops']:,}, Memory: {analysis['memory_bytes']/1024/1024:.2f} MB")
+                        print(f"           Analysis:")
+                        # Indent the explanation further for multi-config
+                        for line in analysis['explanation'].split('\n'):
+                            if line.strip():
+                                print(f"             {line}")
                 
                 print()
     
