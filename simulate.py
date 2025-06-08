@@ -346,9 +346,7 @@ class ModelOperatorParser:
         for batch_size in batch_sizes:
             for context_length in context_lengths:
                 for mode in modes:
-                    # Skip invalid combinations
-                    if mode == "decode" and context_length > 1:
-                        continue
+                    # All combinations are valid - decode mode also depends on context length
                     
                     config_key = f"bs{batch_size}_ctx{context_length}_{mode}"
                     print(f"  Testing configuration: {config_key}")
