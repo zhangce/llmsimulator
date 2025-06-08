@@ -22,21 +22,21 @@ pip install -r requirements.txt
 Parse operators from a HuggingFace model:
 
 ```bash
-python simulate.py --model Qwen/Qwen3-Reranker-4B --ops
+python simulate.py --model Qwen/Qwen3-0.6B --ops
 ```
 
 ### Available Options
 
 - `--model MODEL`: HuggingFace model name (required)
-- `--ops`: Parse and display all operators with detailed information
+- `--ops`: Parse and display all operators with detailed information including input/output tensor shapes
 - `--deps`: Show dependency graph between operators
 - `--summary`: Show model summary with statistics
 
 ### Examples
 
-1. **Display all operators**:
+1. **Display all operators with tensor shapes**:
    ```bash
-   python simulate.py --model Qwen/Qwen3-Reranker-4B --ops
+   python simulate.py --model Qwen/Qwen3-0.6B --ops
    ```
 
 2. **Show model summary**:
@@ -61,6 +61,8 @@ For each operator, the tool displays:
 - Operator type (Linear, Embedding, LayerNorm, etc.)
 - Parameter count
 - Shape information (weight/bias shapes, input/output features)
+- **Input tensor shapes** (captured during forward pass)
+- **Output tensor shapes** (captured during forward pass)
 - Dependencies on other operators
 
 ### Summary (`--summary`)
@@ -78,7 +80,7 @@ For each operator, the tool displays:
 The tool works with any HuggingFace model that can be loaded with `AutoModel.from_pretrained()`. Tested with:
 - BERT variants (bert-base-uncased, distilbert-base-uncased)
 - GPT models (gpt2, gpt2-medium)
-- Qwen models (Qwen/Qwen3-Reranker-4B)
+- Qwen models (Qwen/Qwen3-0.6B, Qwen/Qwen3-Reranker-4B)
 - And many others
 
 ## Requirements

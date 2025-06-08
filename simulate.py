@@ -5,10 +5,10 @@ LLM Simulator - Parse operators and dependencies from HuggingFace models
 
 import argparse
 import sys
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set, Tuple, Any, Union
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoConfig
+from transformers import AutoModel, AutoConfig, AutoTokenizer
 from collections import defaultdict, deque
 
 
@@ -19,6 +19,8 @@ class ModelOperatorParser:
         self.model_name = model_name
         self.operators = {}
         self.dependencies = defaultdict(set)
+        self.hooks = []
+        self.tensor_shapes = {}
         
     def load_model(self):
         """Load the HuggingFace model."""
@@ -26,6 +28,7 @@ class ModelOperatorParser:
             print(f"Loading model: {self.model_name}")
             self.config = AutoConfig.from_pretrained(self.model_name)
             self.model = AutoModel.from_pretrained(self.model_name, torch_dtype=torch.float16)
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
             print(f"Model loaded successfully!")
             return True
         except Exception as e:
@@ -85,6 +88,9 @@ class ModelOperatorParser:
             
             # Determine dependencies based on module hierarchy
             self._analyze_dependencies(name)
+        
+        # Capture tensor shapes through forward pass
+        self._capture_tensor_shapes()
     
     def _get_shape_info(self, module: nn.Module) -> Dict:
         """Extract shape information from a module."""
@@ -135,6 +141,133 @@ class ModelOperatorParser:
             except ValueError:
                 pass
     
+    def _get_tensor_shape(self, tensor: Any) -> List[int]:
+        """Extract shape from tensor, handling various tensor types."""
+        if tensor is None:
+            return []
+        
+        if isinstance(tensor, torch.Tensor):
+            return list(tensor.shape)
+        elif isinstance(tensor, (tuple, list)):
+            # For tuple/list of tensors, return shape of first tensor
+            if len(tensor) > 0 and isinstance(tensor[0], torch.Tensor):
+                return list(tensor[0].shape)
+            return []
+        else:
+            return []
+    
+    def _create_forward_hook(self, name: str):
+        """Create a forward hook to capture input/output tensor shapes."""
+        def hook(module, input, output):
+            input_shapes = []
+            output_shapes = []
+            
+            # Capture input shapes
+            if isinstance(input, (tuple, list)):
+                for inp in input:
+                    shape = self._get_tensor_shape(inp)
+                    if shape:
+                        input_shapes.append(shape)
+            else:
+                shape = self._get_tensor_shape(input)
+                if shape:
+                    input_shapes.append(shape)
+            
+            # Capture output shapes
+            if isinstance(output, (tuple, list)):
+                for out in output:
+                    shape = self._get_tensor_shape(out)
+                    if shape:
+                        output_shapes.append(shape)
+            else:
+                shape = self._get_tensor_shape(output)
+                if shape:
+                    output_shapes.append(shape)
+            
+            self.tensor_shapes[name] = {
+                'input_shapes': input_shapes,
+                'output_shapes': output_shapes
+            }
+        
+        return hook
+    
+    def _register_hooks(self):
+        """Register forward hooks on all modules to capture tensor shapes."""
+        print("Registering hooks to capture tensor shapes...")
+        
+        for name, module in self.model.named_modules():
+            if name == '':  # Skip root module
+                continue
+            
+            hook = module.register_forward_hook(self._create_forward_hook(name))
+            self.hooks.append(hook)
+    
+    def _remove_hooks(self):
+        """Remove all registered hooks."""
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks.clear()
+    
+    def _create_sample_input(self) -> torch.Tensor:
+        """Create a sample input tensor for the model."""
+        # Use a simple sequence for text models
+        sample_text = "Hello, this is a sample input for tensor shape analysis."
+        
+        try:
+            # Try to tokenize the sample text
+            if hasattr(self, 'tokenizer') and self.tokenizer is not None:
+                # Add pad token if it doesn't exist
+                if self.tokenizer.pad_token is None:
+                    self.tokenizer.pad_token = self.tokenizer.eos_token
+                
+                inputs = self.tokenizer(
+                    sample_text, 
+                    return_tensors="pt", 
+                    padding=True, 
+                    truncation=True,
+                    max_length=512
+                )
+                return inputs['input_ids']
+            else:
+                # Fallback: create a simple input tensor based on config
+                vocab_size = getattr(self.config, 'vocab_size', 50000)
+                seq_length = 32
+                return torch.randint(0, min(vocab_size, 1000), (1, seq_length))
+        
+        except Exception as e:
+            print(f"Warning: Could not create proper tokenized input, using fallback: {e}")
+            # Fallback: create a simple input tensor
+            vocab_size = getattr(self.config, 'vocab_size', 50000)
+            seq_length = 32
+            return torch.randint(0, min(vocab_size, 1000), (1, seq_length))
+    
+    def _capture_tensor_shapes(self):
+        """Run a forward pass to capture tensor shapes."""
+        print("Running forward pass to capture tensor shapes...")
+        
+        try:
+            # Set model to evaluation mode
+            self.model.eval()
+            
+            # Create sample input
+            sample_input = self._create_sample_input()
+            print(f"Sample input shape: {list(sample_input.shape)}")
+            
+            # Register hooks
+            self._register_hooks()
+            
+            # Run forward pass
+            with torch.no_grad():
+                _ = self.model(sample_input)
+            
+            print(f"Captured tensor shapes for {len(self.tensor_shapes)} modules")
+            
+        except Exception as e:
+            print(f"Warning: Could not capture tensor shapes: {e}")
+        finally:
+            # Always remove hooks
+            self._remove_hooks()
+    
     def display_operators(self):
         """Display all operators and their information."""
         if not self.operators:
@@ -165,6 +298,14 @@ class ModelOperatorParser:
                 if info['shape_info']:
                     for key, value in info['shape_info'].items():
                         print(f"    {key}: {value}")
+                
+                # Show input/output tensor shapes
+                if name in self.tensor_shapes:
+                    tensor_info = self.tensor_shapes[name]
+                    if tensor_info['input_shapes']:
+                        print(f"    Input tensor shapes: {tensor_info['input_shapes']}")
+                    if tensor_info['output_shapes']:
+                        print(f"    Output tensor shapes: {tensor_info['output_shapes']}")
                 
                 # Show dependencies
                 if name in self.dependencies and self.dependencies[name]:
@@ -228,8 +369,8 @@ class ModelOperatorParser:
 
 def main():
     parser = argparse.ArgumentParser(description='LLM Simulator - Parse operators from HuggingFace models')
-    parser.add_argument('--model', required=True, help='HuggingFace model name (e.g., Qwen/Qwen3-Reranker-4B)')
-    parser.add_argument('--ops', action='store_true', help='Parse and display operators')
+    parser.add_argument('--model', required=True, help='HuggingFace model name (e.g., Qwen/Qwen3-0.6B)')
+    parser.add_argument('--ops', action='store_true', help='Parse and display operators with input/output tensor shapes')
     parser.add_argument('--deps', action='store_true', help='Show dependency graph')
     parser.add_argument('--summary', action='store_true', help='Show model summary')
     
