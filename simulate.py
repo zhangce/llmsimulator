@@ -477,6 +477,276 @@ class ModelOperatorParser:
         
         return result
     
+    def _calculate_flops_and_memory(self, module_name: str, module_type: str, input_shapes: List[List[int]], output_shapes: List[List[int]], module: nn.Module = None) -> Dict[str, Any]:
+        """Calculate FLOPs and memory movement for an operator."""
+        result = {
+            'flops': 0,
+            'memory_bytes': 0,
+            'explanation': "No computation analysis available for this operator type."
+        }
+        
+        if not input_shapes or not output_shapes:
+            return result
+        
+        # Assume float16 (2 bytes per element) since we load models with torch_dtype=torch.float16
+        bytes_per_element = 2
+        
+        try:
+            if module_type == 'Linear':
+                # Linear layer: Y = XW + b
+                # Input: [batch, seq_len, in_features] -> [batch, seq_len, out_features]
+                if len(input_shapes) > 0 and len(output_shapes) > 0:
+                    input_shape = input_shapes[0]  # Take first input
+                    output_shape = output_shapes[0]  # Take first output
+                    
+                    if len(input_shape) >= 2 and len(output_shape) >= 2:
+                        # Calculate dimensions
+                        batch_size = input_shape[0] if len(input_shape) > 0 else 1
+                        seq_len = input_shape[1] if len(input_shape) > 1 else 1
+                        in_features = input_shape[-1]
+                        out_features = output_shape[-1]
+                        
+                        # FLOPs: For each output element, we do in_features multiplications + in_features additions
+                        # Plus bias addition if present
+                        total_output_elements = batch_size * seq_len * out_features
+                        flops_per_output = 2 * in_features  # multiply-add for each input feature
+                        if module and hasattr(module, 'bias') and module.bias is not None:
+                            flops_per_output += 1  # bias addition
+                        
+                        total_flops = total_output_elements * flops_per_output
+                        
+                        # Memory: Read input + weight + bias (if present), write output
+                        input_bytes = batch_size * seq_len * in_features * bytes_per_element
+                        weight_bytes = in_features * out_features * bytes_per_element
+                        bias_bytes = out_features * bytes_per_element if (module and hasattr(module, 'bias') and module.bias is not None) else 0
+                        output_bytes = batch_size * seq_len * out_features * bytes_per_element
+                        
+                        total_memory = input_bytes + weight_bytes + bias_bytes + output_bytes
+                        
+                        result['flops'] = total_flops
+                        result['memory_bytes'] = total_memory
+                        result['explanation'] = f"""Linear Layer Analysis:
+  Input shape: {input_shape} -> Output shape: {output_shape}
+  Matrix multiplication: [{batch_size}×{seq_len}×{in_features}] × [{in_features}×{out_features}] = [{batch_size}×{seq_len}×{out_features}]
+  
+  FLOPs calculation:
+  - Output elements: {batch_size} × {seq_len} × {out_features} = {total_output_elements:,}
+  - Operations per output: {in_features} multiplications + {in_features} additions{"+ 1 bias addition" if bias_bytes > 0 else ""} = {flops_per_output}
+  - Total FLOPs: {total_output_elements:,} × {flops_per_output} = {total_flops:,}
+  
+  Memory movement (HBM → registers):
+  - Input tensor: {batch_size} × {seq_len} × {in_features} × 2 bytes = {input_bytes:,} bytes
+  - Weight matrix: {in_features} × {out_features} × 2 bytes = {weight_bytes:,} bytes
+  {"- Bias vector: " + str(out_features) + " × 2 bytes = " + f"{bias_bytes:,} bytes" if bias_bytes > 0 else "- No bias"}
+  - Output tensor: {batch_size} × {seq_len} × {out_features} × 2 bytes = {output_bytes:,} bytes
+  - Total memory: {total_memory:,} bytes ({total_memory/1024/1024:.2f} MB)"""
+            
+            elif module_type == 'LayerNorm':
+                # LayerNorm: normalize across last dimension
+                if len(input_shapes) > 0:
+                    input_shape = input_shapes[0]
+                    total_elements = 1
+                    for dim in input_shape:
+                        total_elements *= dim
+                    
+                    normalized_features = input_shape[-1]
+                    num_instances = total_elements // normalized_features
+                    
+                    # FLOPs: mean calculation, variance calculation, normalization, scale and shift
+                    # Mean: sum + divide = normalized_features + 1 ops per instance
+                    # Variance: (x-mean)^2 + sum + divide = 2*normalized_features + normalized_features + 1 per instance  
+                    # Normalize: (x-mean)/sqrt(var+eps) = 2*normalized_features per instance
+                    # Scale and shift: gamma*x + beta = 2*normalized_features per instance
+                    flops_per_instance = normalized_features + 1 + 3*normalized_features + 1 + 2*normalized_features + 2*normalized_features
+                    total_flops = num_instances * flops_per_instance
+                    
+                    # Memory: input + output + gamma + beta
+                    input_bytes = total_elements * bytes_per_element
+                    output_bytes = total_elements * bytes_per_element
+                    param_bytes = 2 * normalized_features * bytes_per_element  # gamma + beta
+                    total_memory = input_bytes + output_bytes + param_bytes
+                    
+                    result['flops'] = total_flops
+                    result['memory_bytes'] = total_memory
+                    result['explanation'] = f"""LayerNorm Analysis:
+  Input/Output shape: {input_shape}
+  Normalization across last dimension ({normalized_features} features)
+  Number of normalization instances: {num_instances:,}
+  
+  FLOPs calculation (per instance):
+  - Mean calculation: {normalized_features} + 1 = {normalized_features + 1}
+  - Variance calculation: 3×{normalized_features} + 1 = {3*normalized_features + 1}
+  - Normalization: 2×{normalized_features} = {2*normalized_features}
+  - Scale and shift: 2×{normalized_features} = {2*normalized_features}
+  - Total per instance: {flops_per_instance}
+  - Total FLOPs: {num_instances:,} × {flops_per_instance} = {total_flops:,}
+  
+  Memory movement:
+  - Input tensor: {total_elements:,} × 2 bytes = {input_bytes:,} bytes
+  - Parameters (γ,β): 2 × {normalized_features} × 2 bytes = {param_bytes:,} bytes
+  - Output tensor: {total_elements:,} × 2 bytes = {output_bytes:,} bytes
+  - Total memory: {total_memory:,} bytes ({total_memory/1024/1024:.2f} MB)"""
+            
+            elif module_type == 'Embedding':
+                # Embedding lookup: no FLOPs, just memory access
+                if len(input_shapes) > 0 and len(output_shapes) > 0:
+                    input_shape = input_shapes[0]
+                    output_shape = output_shapes[0]
+                    
+                    # Input is token indices, output is embeddings
+                    num_lookups = 1
+                    for dim in input_shape:
+                        num_lookups *= dim
+                    
+                    embedding_dim = output_shape[-1]
+                    
+                    # No FLOPs for embedding lookup (just table lookup)
+                    total_flops = 0
+                    
+                    # Memory: read embedding table entries + write output
+                    # We only read the specific embeddings we need, not the entire table
+                    embedding_bytes = num_lookups * embedding_dim * bytes_per_element
+                    output_bytes = num_lookups * embedding_dim * bytes_per_element
+                    total_memory = embedding_bytes + output_bytes
+                    
+                    result['flops'] = total_flops
+                    result['memory_bytes'] = total_memory
+                    result['explanation'] = f"""Embedding Lookup Analysis:
+  Input shape: {input_shape} (token indices) -> Output shape: {output_shape}
+  Number of lookups: {num_lookups:,}
+  Embedding dimension: {embedding_dim}
+  
+  FLOPs calculation:
+  - Embedding lookup is a table lookup operation (no arithmetic)
+  - Total FLOPs: 0
+  
+  Memory movement:
+  - Embedding vectors: {num_lookups:,} × {embedding_dim} × 2 bytes = {embedding_bytes:,} bytes
+  - Output tensor: {num_lookups:,} × {embedding_dim} × 2 bytes = {output_bytes:,} bytes
+  - Total memory: {total_memory:,} bytes ({total_memory/1024/1024:.2f} MB)"""
+            
+            elif module_type in ['GELU', 'ReLU', 'SiLU', 'GELUActivation']:
+                # Activation functions: element-wise operations
+                if len(input_shapes) > 0:
+                    input_shape = input_shapes[0]
+                    total_elements = 1
+                    for dim in input_shape:
+                        total_elements *= dim
+                    
+                    # FLOPs depend on activation type
+                    if module_type in ['GELU', 'GELUActivation']:
+                        # GELU is more complex: x * 0.5 * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+                        flops_per_element = 10  # Approximate for GELU
+                        activation_desc = "GELU (complex: ~10 ops per element)"
+                    elif module_type == 'SiLU':
+                        # SiLU: x * sigmoid(x) = x / (1 + exp(-x))
+                        flops_per_element = 4  # Approximate for SiLU
+                        activation_desc = "SiLU (x * sigmoid(x): ~4 ops per element)"
+                    else:  # ReLU
+                        # ReLU: max(0, x)
+                        flops_per_element = 1
+                        activation_desc = "ReLU (max(0,x): 1 comparison per element)"
+                    
+                    total_flops = total_elements * flops_per_element
+                    
+                    # Memory: read input + write output
+                    input_bytes = total_elements * bytes_per_element
+                    output_bytes = total_elements * bytes_per_element
+                    total_memory = input_bytes + output_bytes
+                    
+                    result['flops'] = total_flops
+                    result['memory_bytes'] = total_memory
+                    result['explanation'] = f"""Activation Function Analysis ({module_type}):
+  Input/Output shape: {input_shape}
+  Total elements: {total_elements:,}
+  
+  FLOPs calculation:
+  - Activation type: {activation_desc}
+  - Total FLOPs: {total_elements:,} × {flops_per_element} = {total_flops:,}
+  
+  Memory movement:
+  - Input tensor: {total_elements:,} × 2 bytes = {input_bytes:,} bytes
+  - Output tensor: {total_elements:,} × 2 bytes = {output_bytes:,} bytes
+  - Total memory: {total_memory:,} bytes ({total_memory/1024/1024:.2f} MB)"""
+            
+            elif module_type == 'Dropout':
+                # Dropout: element-wise masking
+                if len(input_shapes) > 0:
+                    input_shape = input_shapes[0]
+                    total_elements = 1
+                    for dim in input_shape:
+                        total_elements *= dim
+                    
+                    # FLOPs: random number generation + comparison + multiplication
+                    flops_per_element = 3  # Approximate
+                    total_flops = total_elements * flops_per_element
+                    
+                    # Memory: read input + write output + mask generation
+                    input_bytes = total_elements * bytes_per_element
+                    output_bytes = total_elements * bytes_per_element
+                    mask_bytes = total_elements * 1  # Assuming 1 byte per mask element
+                    total_memory = input_bytes + output_bytes + mask_bytes
+                    
+                    result['flops'] = total_flops
+                    result['memory_bytes'] = total_memory
+                    result['explanation'] = f"""Dropout Analysis:
+  Input/Output shape: {input_shape}
+  Total elements: {total_elements:,}
+  
+  FLOPs calculation:
+  - Operations per element: random generation + comparison + multiplication = 3
+  - Total FLOPs: {total_elements:,} × 3 = {total_flops:,}
+  
+  Memory movement:
+  - Input tensor: {total_elements:,} × 2 bytes = {input_bytes:,} bytes
+  - Dropout mask: {total_elements:,} × 1 byte = {mask_bytes:,} bytes
+  - Output tensor: {total_elements:,} × 2 bytes = {output_bytes:,} bytes
+  - Total memory: {total_memory:,} bytes ({total_memory/1024/1024:.2f} MB)"""
+            
+            else:
+                # For complex modules, estimate based on input/output sizes
+                if len(input_shapes) > 0 and len(output_shapes) > 0:
+                    input_elements = 1
+                    for shape in input_shapes:
+                        for dim in shape:
+                            input_elements *= dim
+                    
+                    output_elements = 1
+                    for shape in output_shapes:
+                        for dim in shape:
+                            output_elements *= dim
+                    
+                    # Rough estimate: assume some computation per output element
+                    estimated_flops = output_elements * 10  # Conservative estimate
+                    
+                    # Memory: all inputs + all outputs
+                    input_bytes = input_elements * bytes_per_element
+                    output_bytes = output_elements * bytes_per_element
+                    total_memory = input_bytes + output_bytes
+                    
+                    result['flops'] = estimated_flops
+                    result['memory_bytes'] = total_memory
+                    result['explanation'] = f"""Complex Module Analysis ({module_type}):
+  Input shapes: {input_shapes}
+  Output shapes: {output_shapes}
+  
+  FLOPs calculation (estimated):
+  - Output elements: {output_elements:,}
+  - Estimated ops per output: 10 (conservative estimate)
+  - Total FLOPs: {estimated_flops:,}
+  
+  Memory movement:
+  - Input tensors: {input_elements:,} × 2 bytes = {input_bytes:,} bytes
+  - Output tensors: {output_elements:,} × 2 bytes = {output_bytes:,} bytes
+  - Total memory: {total_memory:,} bytes ({total_memory/1024/1024:.2f} MB)
+  
+  Note: This is a rough estimate for complex modules. Actual values may vary."""
+        
+        except Exception as e:
+            result['explanation'] = f"Error calculating FLOPs/memory for {module_type}: {str(e)}"
+        
+        return result
+    
     def display_topological_order(self):
         """Display operators in topological order based on execution."""
         if not self.execution_order:
@@ -511,6 +781,28 @@ class ModelOperatorParser:
                         print(f"     Input shapes: {tensor_info['input_shapes']}")
                     if tensor_info['output_shapes']:
                         print(f"     Output shapes: {tensor_info['output_shapes']}")
+                    
+                    # Calculate and display computational analysis
+                    module = None
+                    for module_name, module_obj in self.model.named_modules():
+                        if module_name == name:
+                            module = module_obj
+                            break
+                    
+                    analysis = self._calculate_flops_and_memory(
+                        name, info['type'], 
+                        tensor_info['input_shapes'], 
+                        tensor_info['output_shapes'],
+                        module
+                    )
+                    
+                    print(f"     FLOPs: {analysis['flops']:,}")
+                    print(f"     Memory: {analysis['memory_bytes']:,} bytes ({analysis['memory_bytes']/1024/1024:.2f} MB)")
+                    print(f"     Analysis:")
+                    # Indent the explanation
+                    for line in analysis['explanation'].split('\n'):
+                        if line.strip():
+                            print(f"       {line}")
                 
                 # Show execution dependencies (limited to avoid clutter)
                 if name in self.execution_dependencies and self.execution_dependencies[name]:
@@ -579,6 +871,22 @@ class ModelOperatorParser:
                             print(f"           Input:  {shapes['input_shapes']}")
                         if shapes['output_shapes']:
                             print(f"           Output: {shapes['output_shapes']}")
+                        
+                        # Add compact computational analysis
+                        module = None
+                        for module_name, module_obj in self.model.named_modules():
+                            if module_name == op_name:
+                                module = module_obj
+                                break
+                        
+                        analysis = self._calculate_flops_and_memory(
+                            op_name, info['type'], 
+                            shapes['input_shapes'], 
+                            shapes['output_shapes'],
+                            module
+                        )
+                        
+                        print(f"           FLOPs: {analysis['flops']:,}, Memory: {analysis['memory_bytes']/1024/1024:.2f} MB")
                 
                 # Display decode configurations
                 if decode_configs:
@@ -595,6 +903,22 @@ class ModelOperatorParser:
                             print(f"           Input:  {shapes['input_shapes']}")
                         if shapes['output_shapes']:
                             print(f"           Output: {shapes['output_shapes']}")
+                        
+                        # Add compact computational analysis
+                        module = None
+                        for module_name, module_obj in self.model.named_modules():
+                            if module_name == op_name:
+                                module = module_obj
+                                break
+                        
+                        analysis = self._calculate_flops_and_memory(
+                            op_name, info['type'], 
+                            shapes['input_shapes'], 
+                            shapes['output_shapes'],
+                            module
+                        )
+                        
+                        print(f"           FLOPs: {analysis['flops']:,}, Memory: {analysis['memory_bytes']/1024/1024:.2f} MB")
                 
                 print()
     
@@ -636,6 +960,28 @@ class ModelOperatorParser:
                         print(f"    Input tensor shapes: {tensor_info['input_shapes']}")
                     if tensor_info['output_shapes']:
                         print(f"    Output tensor shapes: {tensor_info['output_shapes']}")
+                    
+                    # Calculate and display computational analysis
+                    module = None
+                    for module_name, module_obj in self.model.named_modules():
+                        if module_name == name:
+                            module = module_obj
+                            break
+                    
+                    analysis = self._calculate_flops_and_memory(
+                        name, info['type'], 
+                        tensor_info['input_shapes'], 
+                        tensor_info['output_shapes'],
+                        module
+                    )
+                    
+                    print(f"    FLOPs: {analysis['flops']:,}")
+                    print(f"    Memory: {analysis['memory_bytes']:,} bytes ({analysis['memory_bytes']/1024/1024:.2f} MB)")
+                    print(f"    Analysis:")
+                    # Indent the explanation
+                    for line in analysis['explanation'].split('\n'):
+                        if line.strip():
+                            print(f"      {line}")
                 
                 # Show dependencies
                 if name in self.dependencies and self.dependencies[name]:
