@@ -223,7 +223,7 @@ class ModelOperatorParser:
         sorted_layers.sort(key=lambda x: x[0])
         
         # Add dependencies between consecutive layers
-        # Each layer depends on the output operations of the previous layer
+        # Only the first operation in each layer (sa_layer_norm) depends on the previous layer
         for i in range(1, len(sorted_layers)):
             prev_layer_ops = sorted_layers[i-1][2]
             curr_layer_ops = sorted_layers[i][2]
@@ -232,29 +232,32 @@ class ModelOperatorParser:
             # These are typically the last operations in the execution order
             prev_output_ops = self._find_layer_output_ops(prev_layer_ops)
             
-            # Each operator in current layer depends on the output ops of previous layer
+            # Only connect to the first operation in current layer (input layer norm)
+            # The intra-layer dependencies will handle the rest
             for curr_op in curr_layer_ops:
-                for prev_output_op in prev_output_ops:
-                    self.dependencies[curr_op].add(prev_output_op)
+                if any(x in curr_op for x in ['sa_layer_norm', 'input_layernorm', 'ln_1']):
+                    for prev_output_op in prev_output_ops:
+                        self.dependencies[curr_op].add(prev_output_op)
+                    break  # Only connect to the first operation (input layer norm)
     
     def _find_layer_output_ops(self, layer_ops: List[str]) -> List[str]:
         """Find the output operations of a layer (typically the last operations)."""
         # For transformer layers, the output is usually:
-        # 1. The output layer norm, or
-        # 2. The final linear layer in FFN, or  
+        # 1. The final FFN/MLP operations (down_proj, lin2, fc2, etc.), or
+        # 2. The output layer norm if no FFN found, or  
         # 3. The last operation alphabetically as fallback
         
         output_ops = []
         
-        # Look for output layer norm first
+        # Look for FFN/MLP output operations first (these are typically the true outputs)
         for op in layer_ops:
-            if 'output' in op and 'norm' in op:
+            if any(x in op for x in ['down_proj', 'lin2', 'fc2', 'c_proj']) and any(x in op for x in ['ffn', 'mlp', 'feed_forward']):
                 output_ops.append(op)
         
-        # If no output norm, look for FFN output (lin2, fc2, etc.)
+        # If no FFN output, look for output layer norm
         if not output_ops:
             for op in layer_ops:
-                if ('ffn' in op or 'mlp' in op) and ('lin2' in op or 'fc2' in op or 'dense' in op):
+                if any(x in op for x in ['output_layer_norm', 'post_attention_layernorm', 'ln_2']):
                     output_ops.append(op)
         
         # If still no output ops, take the last few operations as fallback
@@ -311,13 +314,16 @@ class ModelOperatorParser:
             ffn_ops = []
             
             for op in ops:
-                if 'sa_layer_norm' in op:
+                # Handle different naming conventions for layer norms
+                if any(x in op for x in ['sa_layer_norm', 'input_layernorm', 'ln_1']):
                     sa_norm = op
-                elif 'output_layer_norm' in op:
+                elif any(x in op for x in ['output_layer_norm', 'post_attention_layernorm', 'ln_2']):
                     output_norm = op
-                elif 'attention' in op:
+                # Handle different naming conventions for attention operations
+                elif any(x in op for x in ['attention', 'self_attn', 'attn']) and not any(x in op for x in ['norm', 'layernorm']):
                     attention_ops.append(op)
-                elif 'ffn' in op or 'mlp' in op:
+                # Handle different naming conventions for FFN/MLP operations
+                elif any(x in op for x in ['ffn', 'mlp', 'feed_forward']) and not any(x in op for x in ['norm', 'layernorm']):
                     ffn_ops.append(op)
             
             # Build intra-layer dependencies: sa_norm → attention → output_norm → ffn
@@ -387,9 +393,9 @@ class ModelOperatorParser:
         if not first_layer_ops:
             return
         
-        # Connect embedding output to first layer's sa_layer_norm
+        # Connect embedding output to first layer's input layer norm
         for op in first_layer_ops:
-            if 'sa_layer_norm' in op:
+            if any(x in op for x in ['sa_layer_norm', 'input_layernorm', 'ln_1']):
                 self.dependencies[op].add(embedding_output)
                 break
     
