@@ -590,8 +590,9 @@ class ModelOperatorParser:
                         # Parse config key for readable format
                         parts = config_key.split('_')
                         batch_size = parts[0][2:]  # Remove 'bs'
+                        context_length = parts[1][3:]  # Remove 'ctx'
                         
-                        print(f"         Batch={batch_size}:")
+                        print(f"         Batch={batch_size}, Context={context_length}:")
                         if shapes['input_shapes']:
                             print(f"           Input:  {shapes['input_shapes']}")
                         if shapes['output_shapes']:

@@ -95,13 +95,16 @@ For each operator, the tool displays:
 
 ### Multi-Configuration Analysis (`--multi-config`)
 - Comprehensive tensor shape analysis across different inference scenarios
-- Tests multiple batch sizes: 1, 16, 64
-- Tests multiple context lengths: 1, 128, 512
+- Tests multiple batch sizes: 1, 16
+- Tests multiple context lengths: 1, 128
 - Analyzes both prefill and decode modes
 - Shows how tensor shapes change based on:
   - **Batch size**: Impact on parallel processing
-  - **Context length**: Memory and computation scaling in prefill mode
-  - **Prefill vs Decode**: Different computation patterns for initial processing vs token generation
+  - **Context length**: Memory and computation scaling for both prefill and decode
+  - **Prefill vs Decode**: Different computation patterns
+    - **Prefill**: Process full input context (e.g., 128 tokens)
+    - **Decode**: Generate tokens one by one, but still attend to full context (prefilled + generated tokens)
+- **Corrected decode mode**: Now properly shows context length dependency in output
 - Essential for memory planning, performance optimization, and hardware sizing
 
 ## Supported Models
