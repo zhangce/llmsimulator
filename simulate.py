@@ -414,6 +414,66 @@ class ModelOperatorParser:
         
         return color_map.get(operator_type, '#95A5A6')  # Default gray
     
+    def _create_topological_layout(self, G: nx.DiGraph) -> Dict[str, Tuple[float, float]]:
+        """Create a topological layout with dependencies strictly before dependents."""
+        pos = {}
+        
+        try:
+            # Get topological ordering
+            topo_order = list(nx.topological_sort(G))
+        except nx.NetworkXError:
+            # If graph has cycles, fall back to a simple ordering
+            print("Warning: Graph has cycles, using simple ordering")
+            topo_order = list(G.nodes())
+        
+        print(f"Arranging {len(topo_order)} nodes in topological order...")
+        
+        # Calculate topological levels (distance from source nodes)
+        levels = {}
+        for node in topo_order:
+            predecessors = list(G.predecessors(node))
+            if not predecessors:
+                levels[node] = 0  # Source node
+            else:
+                levels[node] = max(levels.get(pred, 0) for pred in predecessors) + 1
+        
+        # Group nodes by level
+        level_groups = defaultdict(list)
+        for node, level in levels.items():
+            level_groups[level].append(node)
+        
+        max_level = max(level_groups.keys()) if level_groups else 0
+        print(f"Graph has {max_level + 1} topological levels")
+        
+        # Calculate spacing based on number of levels and nodes
+        x_spacing = max(4.0, 20.0 / (max_level + 1))  # Adaptive horizontal spacing
+        y_spacing = 1.5
+        
+        # Position nodes level by level
+        for level, nodes in level_groups.items():
+            x = level * x_spacing
+            
+            # Sort nodes within level by name for consistency
+            nodes.sort()
+            
+            # Arrange nodes vertically within the level
+            if len(nodes) == 1:
+                y = 0
+                pos[nodes[0]] = (x, y)
+            else:
+                # Use adaptive vertical spacing
+                max_nodes_per_level = max(len(group) for group in level_groups.values())
+                adaptive_y_spacing = max(1.0, min(3.0, 30.0 / max_nodes_per_level))
+                
+                total_height = (len(nodes) - 1) * adaptive_y_spacing
+                start_y = -total_height / 2
+                
+                for i, node in enumerate(nodes):
+                    y = start_y + i * adaptive_y_spacing
+                    pos[node] = (x, y)
+        
+        return pos
+    
     def _create_hierarchical_layout(self, G: nx.DiGraph) -> Dict[str, Tuple[float, float]]:
         """Create a hierarchical layout based on module hierarchy."""
         pos = {}
@@ -485,14 +545,17 @@ class ModelOperatorParser:
                  fontsize=16, fontweight='bold', pad=20)
         
         # Choose layout
-        if layout == 'hierarchical':
+        if layout == 'topological':
+            pos = self._create_topological_layout(G)
+        elif layout == 'hierarchical':
             pos = self._create_hierarchical_layout(G)
         elif layout == 'spring':
             pos = nx.spring_layout(G, k=3, iterations=50, seed=42)
         elif layout == 'circular':
             pos = nx.circular_layout(G)
         else:
-            pos = nx.spring_layout(G, seed=42)
+            # Default to topological for best readability
+            pos = self._create_topological_layout(G)
         
         # Get node colors based on operator types
         node_colors = []
@@ -522,10 +585,16 @@ class ModelOperatorParser:
         
         # Draw the graph
         nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=node_sizes, 
-                              alpha=0.8, linewidths=1, edgecolors='black')
+                              alpha=0.9, linewidths=1.5, edgecolors='black')
         
-        nx.draw_networkx_edges(G, pos, edge_color='gray', arrows=True, 
-                              arrowsize=20, arrowstyle='->', alpha=0.6, width=1)
+        # Draw edges with better visibility for topological layout
+        if layout == 'topological':
+            nx.draw_networkx_edges(G, pos, edge_color='#2C3E50', arrows=True, 
+                                  arrowsize=15, arrowstyle='->', alpha=0.7, width=1.5,
+                                  connectionstyle="arc3,rad=0.1")  # Slight curve for better visibility
+        else:
+            nx.draw_networkx_edges(G, pos, edge_color='gray', arrows=True, 
+                                  arrowsize=20, arrowstyle='->', alpha=0.6, width=1)
         
         if show_labels:
             # Create labels (shortened for readability)
@@ -592,8 +661,8 @@ def main():
     # Visualization options
     parser.add_argument('--output', type=str, help='Output file for visualization (default: auto-generated)')
     parser.add_argument('--max-nodes', type=int, default=50, help='Maximum nodes to display in visualization (default: 50)')
-    parser.add_argument('--layout', choices=['hierarchical', 'spring', 'circular'], default='hierarchical',
-                       help='Layout algorithm for visualization (default: hierarchical)')
+    parser.add_argument('--layout', choices=['topological', 'hierarchical', 'spring', 'circular'], default='topological',
+                       help='Layout algorithm for visualization (default: topological)')
     parser.add_argument('--no-labels', action='store_true', help='Hide node labels in visualization')
     parser.add_argument('--figsize', type=int, nargs=2, default=[20, 16], metavar=('WIDTH', 'HEIGHT'),
                        help='Figure size for visualization (default: 20 16)')

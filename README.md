@@ -85,14 +85,14 @@ For each operator, the tool displays:
 - **Graphical dependency graph** showing operator relationships
 - **Color-coded nodes** by operator type
 - **Node sizes** proportional to parameter count
-- **Multiple layout options**: hierarchical, spring, circular
+- **Multiple layout options**: topological (default), hierarchical, spring, circular
 - **Customizable output**: PNG files with high resolution
 - **Interactive features**: legends, statistics, and labels
 
 #### Visualization Options
 - `--output FILE`: Specify output file path
 - `--max-nodes N`: Limit displayed nodes (default: 50)
-- `--layout LAYOUT`: Choose layout algorithm (hierarchical/spring/circular)
+- `--layout LAYOUT`: Choose layout algorithm (topological/hierarchical/spring/circular)
 - `--no-labels`: Hide node labels for cleaner view
 - `--figsize W H`: Set figure dimensions
 
