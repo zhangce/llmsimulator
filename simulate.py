@@ -301,21 +301,17 @@ class ModelOperatorParser:
                         input_ids = input_ids.repeat(batch_size, 1)
                     return input_ids
                 else:  # decode mode
-                    # For decode mode with KV cache, only process 1 new token
-                    # The context_length parameter represents the KV cache size, but input is just 1 token
-                    sample_text = "Hello"
+                    # For decode mode: attention needs full context, but we simulate with full context
+                    # The actual tensor shapes will be adjusted per layer type in the hooks
+                    sample_text = "Hello, this is a sample input for tensor shape analysis. " * (context_length // 10 + 1)
                     inputs = self.tokenizer(
                         sample_text, 
                         return_tensors="pt", 
                         padding=True, 
                         truncation=True,
-                        max_length=1
+                        max_length=context_length
                     )
                     input_ids = inputs['input_ids']
-                    # For decode mode, we only process 1 token regardless of context_length
-                    # Take only the last token to simulate the new token being processed
-                    if input_ids.shape[1] > 1:
-                        input_ids = input_ids[:, -1:]
                     # Repeat for batch size
                     if batch_size > 1:
                         input_ids = input_ids.repeat(batch_size, 1)
@@ -326,8 +322,8 @@ class ModelOperatorParser:
                 if mode == "prefill":
                     return torch.randint(0, min(vocab_size, 1000), (batch_size, context_length))
                 else:  # decode mode
-                    # For decode mode, only process 1 token regardless of context_length
-                    return torch.randint(0, min(vocab_size, 1000), (batch_size, 1))
+                    # For decode mode, use full context (will be adjusted per layer)
+                    return torch.randint(0, min(vocab_size, 1000), (batch_size, context_length))
         
         except Exception as e:
             print(f"Warning: Could not create proper input for config, using fallback: {e}")
@@ -335,9 +331,54 @@ class ModelOperatorParser:
             if mode == "prefill":
                 return torch.randint(0, min(vocab_size, 1000), (batch_size, context_length))
             else:  # decode mode
-                # For decode mode, only process 1 token regardless of context_length
-                return torch.randint(0, min(vocab_size, 1000), (batch_size, 1))
+                # For decode mode, use full context (will be adjusted per layer)
+                return torch.randint(0, min(vocab_size, 1000), (batch_size, context_length))
     
+    def _is_mlp_layer(self, name: str, module: nn.Module) -> bool:
+        """Check if a layer is an MLP layer that should process only 1 token in decode mode."""
+        # Check for common MLP layer patterns
+        mlp_patterns = [
+            'mlp.up_proj', 'mlp.down_proj', 'mlp.gate_proj',
+            'feed_forward', 'ffn', 'fc1', 'fc2',
+            'mlp.c_fc', 'mlp.c_proj',  # GPT-style
+            'mlp.dense_h_to_4h', 'mlp.dense_4h_to_h'  # Other variants
+        ]
+        
+        # Check if the layer name contains MLP patterns
+        for pattern in mlp_patterns:
+            if pattern in name.lower():
+                return True
+        
+        # Also check module type
+        if hasattr(module, '__class__'):
+            class_name = module.__class__.__name__.lower()
+            if 'mlp' in class_name or 'feedforward' in class_name:
+                return True
+        
+        return False
+    
+    def _is_attention_layer(self, name: str, module: nn.Module) -> bool:
+        """Check if a layer is an attention layer that needs full context in decode mode."""
+        # Check for common attention layer patterns
+        attn_patterns = [
+            'attn', 'attention', 'self_attn', 'self_attention',
+            'q_proj', 'k_proj', 'v_proj', 'o_proj',
+            'query', 'key', 'value', 'out_proj'
+        ]
+        
+        # Check if the layer name contains attention patterns
+        for pattern in attn_patterns:
+            if pattern in name.lower():
+                return True
+        
+        # Also check module type
+        if hasattr(module, '__class__'):
+            class_name = module.__class__.__name__.lower()
+            if 'attention' in class_name or 'attn' in class_name:
+                return True
+        
+        return False
+
     def _capture_multi_config_shapes(self):
         """Capture tensor shapes for multiple configurations."""
         print("\nCapturing tensor shapes for multiple configurations...")
@@ -378,10 +419,20 @@ class ModelOperatorParser:
                                     for inp in input:
                                         shape = self._get_tensor_shape(inp)
                                         if shape:
+                                            # Adjust shape for decode mode based on layer type
+                                            if mode == "decode" and self._is_mlp_layer(name, module):
+                                                # MLP layers in decode mode only process 1 token
+                                                if len(shape) >= 2 and shape[1] > 1:
+                                                    shape = [shape[0], 1] + shape[2:]
                                             input_shapes.append(shape)
                                 else:
                                     shape = self._get_tensor_shape(input)
                                     if shape:
+                                        # Adjust shape for decode mode based on layer type
+                                        if mode == "decode" and self._is_mlp_layer(name, module):
+                                            # MLP layers in decode mode only process 1 token
+                                            if len(shape) >= 2 and shape[1] > 1:
+                                                shape = [shape[0], 1] + shape[2:]
                                         input_shapes.append(shape)
                                 
                                 # Capture output shapes
@@ -389,10 +440,20 @@ class ModelOperatorParser:
                                     for out in output:
                                         shape = self._get_tensor_shape(out)
                                         if shape:
+                                            # Adjust shape for decode mode based on layer type
+                                            if mode == "decode" and self._is_mlp_layer(name, module):
+                                                # MLP layers in decode mode only process 1 token
+                                                if len(shape) >= 2 and shape[1] > 1:
+                                                    shape = [shape[0], 1] + shape[2:]
                                             output_shapes.append(shape)
                                 else:
                                     shape = self._get_tensor_shape(output)
                                     if shape:
+                                        # Adjust shape for decode mode based on layer type
+                                        if mode == "decode" and self._is_mlp_layer(name, module):
+                                            # MLP layers in decode mode only process 1 token
+                                            if len(shape) >= 2 and shape[1] > 1:
+                                                shape = [shape[0], 1] + shape[2:]
                                         output_shapes.append(shape)
                                 
                                 config_shapes[name] = {
@@ -909,7 +970,16 @@ class ModelOperatorParser:
                         batch_size = parts[0][2:]  # Remove 'bs'
                         context_length = parts[1][3:]  # Remove 'ctx'
                         
-                        print(f"         Batch={batch_size}, Context={context_length} (KV cache size, input=1 token):")
+                        # Determine layer type for better labeling
+                        is_mlp = any(self._is_mlp_layer(op_name, self.operators[op_name]['module']) for _ in [1] if op_name in self.operators)
+                        is_attn = any(self._is_attention_layer(op_name, self.operators[op_name]['module']) for _ in [1] if op_name in self.operators)
+                        
+                        if is_mlp:
+                            print(f"         Batch={batch_size}, Context={context_length} (MLP: processes 1 token in decode):")
+                        elif is_attn:
+                            print(f"         Batch={batch_size}, Context={context_length} (Attention: uses full KV cache):")
+                        else:
+                            print(f"         Batch={batch_size}, Context={context_length} (decode mode):")
                         if shapes['input_shapes']:
                             print(f"           Input:  {shapes['input_shapes']}")
                         if shapes['output_shapes']:

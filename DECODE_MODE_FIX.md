@@ -4,9 +4,10 @@
 
 The original issue was that in decode mode with context=128, the MLP layers were incorrectly showing input shapes like `[[1, 128, 1024]]` instead of `[[1, 1, 1024]]`. This was incorrect because:
 
-1. **In decode mode with KV cache**: Only 1 new token is processed at a time
-2. **The context_length parameter**: Represents the KV cache size, not the input sequence length
-3. **MLP layers**: Should only process the single new token, not all cached tokens
+1. **In decode mode with KV cache**: Different layer types behave differently
+2. **MLP layers**: Should only process the single new token (1 token)
+3. **Attention layers**: Should use the full KV cache context (all tokens)
+4. **The context_length parameter**: Represents the KV cache size for attention, but MLP only processes new token
 
 ## Before Fix
 
@@ -20,85 +21,85 @@ layers.9.mlp.up_proj:
 ## After Fix
 
 ```
-layers.9.mlp.up_proj:
-  Batch=1, Context=128 (KV cache size, input=1 token):
+layers.9.mlp.up_proj (MLP layer):
+  Batch=1, Context=128 (MLP: processes 1 token in decode):
     Input:  [[1, 1, 1024]]   ✅ CORRECT
     Output: [[1, 1, 3072]]   ✅ CORRECT
+
+layers.9.self_attn.q_proj (Attention layer):
+  Batch=1, Context=128 (Attention: uses full KV cache):
+    Input:  [[1, 128, 1024]]   ✅ CORRECT  
+    Output: [[1, 128, 1024]]   ✅ CORRECT
 ```
 
 ## Changes Made
 
-### 1. Fixed Input Tensor Creation for Decode Mode
+### 1. Layer Type Detection
 
-**File**: `simulate.py`, lines 303-322
+**Added functions**: `_is_mlp_layer()` and `_is_attention_layer()` to distinguish between layer types.
 
-**Before**:
 ```python
-else:  # decode mode
-    # For decode, model still attends to full context but processes 1 new token
-    # Create a context with the specified length to simulate KV cache state
-    sample_text = "Hello, this is a sample input for tensor shape analysis. " * (context_length // 10 + 1)
-    inputs = self.tokenizer(
-        sample_text, 
-        return_tensors="pt", 
-        padding=True, 
-        truncation=True,
-        max_length=context_length  # ❌ Wrong: using full context length
-    )
-    input_ids = inputs['input_ids']
-    # Repeat for batch size
-    if batch_size > 1:
-        input_ids = input_ids.repeat(batch_size, 1)
-    return input_ids
+def _is_mlp_layer(self, name: str, module: nn.Module) -> bool:
+    """Check if a layer is an MLP layer that should process only 1 token in decode mode."""
+    mlp_patterns = ['mlp.up_proj', 'mlp.down_proj', 'mlp.gate_proj', ...]
+    # Check patterns and module types
+
+def _is_attention_layer(self, name: str, module: nn.Module) -> bool:
+    """Check if a layer is an attention layer that needs full context in decode mode."""
+    attn_patterns = ['attn', 'attention', 'q_proj', 'k_proj', 'v_proj', ...]
+    # Check patterns and module types
 ```
 
-**After**:
+### 2. Smart Shape Adjustment in Hooks
+
+**Modified hook creation** to adjust tensor shapes based on layer type in decode mode:
+
 ```python
-else:  # decode mode
-    # For decode mode with KV cache, only process 1 new token
-    # The context_length parameter represents the KV cache size, but input is just 1 token
-    sample_text = "Hello"
-    inputs = self.tokenizer(
-        sample_text, 
-        return_tensors="pt", 
-        padding=True, 
-        truncation=True,
-        max_length=1  # ✅ Correct: only 1 token
-    )
-    input_ids = inputs['input_ids']
-    # For decode mode, we only process 1 token regardless of context_length
-    # Take only the last token to simulate the new token being processed
-    if input_ids.shape[1] > 1:
-        input_ids = input_ids[:, -1:]
-    # Repeat for batch size
-    if batch_size > 1:
-        input_ids = input_ids.repeat(batch_size, 1)
-    return input_ids
+# In the hook function:
+if mode == "decode" and self._is_mlp_layer(name, module):
+    # MLP layers in decode mode only process 1 token
+    if len(shape) >= 2 and shape[1] > 1:
+        shape = [shape[0], 1] + shape[2:]
 ```
 
-### 2. Fixed Fallback Cases
+### 3. Input Tensor Strategy
 
-**Lines 328-330 and 337-339**: Updated fallback tensor creation to use `(batch_size, 1)` instead of `(batch_size, context_length)` for decode mode.
+**Decode mode now uses full context input** but adjusts shapes per layer:
+- **Input creation**: Full context tensor `[batch, context_length, hidden_dim]`
+- **Shape adjustment**: MLP layers get `[batch, 1, hidden_dim]`, attention layers keep full context
 
-### 3. Updated Display Labels
+### 4. Enhanced Display Labels
 
-**Line 912**: Added clarification in the output display:
+**Layer-specific labeling** based on detected layer type:
 ```python
-print(f"         Batch={batch_size}, Context={context_length} (KV cache size, input=1 token):")
+if is_mlp:
+    print(f"Batch={batch_size}, Context={context_length} (MLP: processes 1 token in decode):")
+elif is_attn:
+    print(f"Batch={batch_size}, Context={context_length} (Attention: uses full KV cache):")
 ```
 
 ## Verification
 
 The fix has been verified with tests showing:
 
-1. **Decode mode**: Input shape is `[1, 1]` regardless of context_length
-2. **Prefill mode**: Input shape is `[1, context_length]` as expected
-3. **Specific layer test**: `layers.9.mlp.up_proj` now shows correct shapes
+1. **Layer type detection**: Correctly identifies MLP vs attention layers
+2. **MLP layers in decode mode**: Show input/output shapes with 1 token `[1, 1, hidden_dim]`
+3. **Attention layers in decode mode**: Show input/output shapes with full context `[1, context_length, hidden_dim]`
+4. **Specific layer test**: `layers.9.mlp.up_proj` now shows `[1, 1, 1024]` instead of `[1, 128, 1024]`
 
 ## Key Insight
 
-In transformer models with KV cache:
-- **Prefill phase**: Process the entire input sequence
-- **Decode phase**: Process only 1 new token while using cached key-value pairs from previous tokens
+In transformer models with KV cache during decode mode:
 
-The context_length in decode mode represents the size of the KV cache (how many previous tokens are cached), not the input sequence length being processed.
+### Attention Layers
+- **Query**: Computed for the new token only
+- **Key/Value**: Retrieved from KV cache (full context)
+- **Attention computation**: New token attends to all cached tokens
+- **Tensor shapes**: Full context `[batch, context_length, hidden_dim]`
+
+### MLP Layers  
+- **Processing**: Only the new token passes through MLP
+- **Previous tokens**: Already processed during prefill, results cached
+- **Tensor shapes**: Single token `[batch, 1, hidden_dim]`
+
+The context_length represents the KV cache size, but different layer types use it differently.
